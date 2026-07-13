@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.bak
+*.bak_*
+# data / artifacts
+*.pt
+*.pth
+*.npy
+*.png
+*.jpg
+results/
+results_*/
+checkpoints/
+outputs/
+datasets/
+*.log
+.DS_Store
