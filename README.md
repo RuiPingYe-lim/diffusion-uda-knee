@@ -116,8 +116,11 @@ python src/bbdm_strict/eval_moment_self_oracle.py --clf_ckpt <cls.pt> \
     --slice_csv <target_test.csv> --source_csv <source_train.csv> \
     --bbdm_config <moment_self_pure.json> --bbdm_ckpt <bbdm.pt>
 ```
-Compare `moment_bbdm` against the `moment_vae` oracle (NOT against historical numbers). Shared source
-intensity stats come from `source_style_stats.py` (cached) so all scripts use identical statistics.
+Compare `moment_bbdm` against the `moment_vae` oracle (NOT against historical numbers). The Oracle also
+reports a bootstrap 95% CI and a fidelity decomposition (pure-bridge latent/image error vs VAE error).
+The `moment_self` dataset and the Oracle read **identical** cached source stats via `source_style_stats.py`
+(same n/seed/image_size); the legacy `eval_style_match.py` still computes its own stats, so its numbers
+are not directly comparable to the diagnostic.
 
 ## Notes
 

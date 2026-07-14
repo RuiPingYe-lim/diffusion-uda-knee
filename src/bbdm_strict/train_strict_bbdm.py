@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--target_csv", type=str, default=None)
     ap.add_argument("--source_root", type=str, default=None)
     ap.add_argument("--target_root", type=str, default=None)
-    ap.add_argument("--pair_mode", type=str, default=None, choices=["label_random", "paired_csv"])
+    ap.add_argument("--pair_mode", type=str, default=None, choices=["label_random", "paired_csv", "moment_self"])
     ap.add_argument("--image_size", type=int, default=None)
     ap.add_argument("--batch_size", type=int, default=None)
     ap.add_argument("--epochs", type=int, default=None)
@@ -180,10 +180,20 @@ def _to_serializable(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _sample_train_t_indices(batch_size: int, num_train_timesteps: int, device: torch.device) -> torch.Tensor:
+def _sample_train_t_indices(batch_size: int, num_train_timesteps: int, device: torch.device,
+                            endpoint_frac: float = 0.1) -> torch.Tensor:
     if num_train_timesteps < 3:
         raise ValueError("num_train_timesteps must be >= 3 for stable pseudo-paired BBDM-style training")
-    return torch.randint(low=1, high=num_train_timesteps, size=(batch_size,), device=device, dtype=torch.long)
+    T = int(num_train_timesteps)
+    # Sample t in [1, T] INCLUSIVE (randint high is exclusive -> high=T+1) so the model
+    # trains on t=T (the reverse-sampling start state x_t=x_B). Additionally oversample the
+    # endpoint t=T at `endpoint_frac`, since a uniform sampler would see t=T only ~1/T of the
+    # time. Fixes the train/inference mismatch where reverse step 1 (t=T) was never trained.
+    t = torch.randint(low=1, high=T + 1, size=(batch_size,), device=device, dtype=torch.long)
+    if endpoint_frac and endpoint_frac > 0.0:
+        mask = torch.rand(batch_size, device=device) < float(endpoint_frac)
+        t = torch.where(mask, torch.full_like(t, T), t)
+    return t
 
 
 def _gradient_maps(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -346,6 +356,19 @@ def _ae_feat_consistency_loss(ae_model: AEUNet, x_pred: torch.Tensor, x_ref: tor
 def main() -> None:
     args = parse_args()
     cfg = load_config(args)
+
+    # Fail-fast: moment_self is a content-preserving diagnostic. SupCon would treat all
+    # label=-1 endpoints as one class, and the pixel self-preservation losses pull the output
+    # back toward the ORIGINAL target style, fighting the style change the bridge must learn.
+    # Both would confound the root-cause diagnostic, so require them off.
+    if str(cfg.get("pair_mode", "")).lower() == "moment_self":
+        forbidden = ["lambda_supcon", "lambda_self_l1", "lambda_self_ssim", "lambda_self_edge"]
+        active = {k: cfg.get(k) for k in forbidden if float(cfg.get(k, 0) or 0) != 0.0}
+        if active:
+            raise ValueError(
+                f"pair_mode='moment_self' requires {forbidden} = 0 (self-preservation/SupCon "
+                f"losses confound the diagnostic), but these are active: {active}")
+
     set_seed(int(cfg["seed"]))
 
     run_dir = Path(cfg["run_root"]) / str(cfg["exp_name"])

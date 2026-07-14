@@ -108,7 +108,11 @@ def main():
     clf = build_model(a.backbone, 2, "none", dev)
     ck = torch.load(a.clf_ckpt, map_location=dev, weights_only=False)
     sd = ck.get("state_dict", ck.get("model", ck))
-    clf.load_state_dict({k.replace("module.", ""): v for k, v in sd.items()}, strict=False); clf.to(dev).eval()
+    res = clf.load_state_dict({k.replace("module.", ""): v for k, v in sd.items()}, strict=False)
+    print("[clf load] missing=%d unexpected=%d" % (len(res.missing_keys), len(res.unexpected_keys)))
+    if res.missing_keys:
+        print("  missing:", res.missing_keys[:8])
+    clf.to(dev).eval()
 
     ae = load_ae_model(cfg["ae_ckpt"], cfg.get("ae_config"), device=dev, freeze=True)
     with torch.no_grad():
@@ -135,32 +139,50 @@ def main():
     dl = DataLoader(DS(a.slice_csv, a.image_size, smean, sstd), batch_size=a.batch_size, shuffle=False, num_workers=6)
     P = {k: [] for k in ["direct_128", "moment_oracle", "moment_vae", "moment_bbdm"]}
     Y, C = [], []
-    fid_mae, fid_dmu, fid_dsd = [], [], []
+    # fidelity decomposed: pure-bridge (latent & image) vs VAE vs total
+    fid_bridge_lat, fid_bridge_img, fid_vae_img, fid_total_img = [], [], [], []
     with torch.no_grad():
         for xb, xm, y, c in dl:
             xb, xm = xb.to(dev), xm.to(dev)
             P["direct_128"] += list(torch.softmax(clf(to224(xb)), 1)[:, 1].cpu().numpy())
             P["moment_oracle"] += list(torch.softmax(clf(to224(xm)), 1)[:, 1].cpu().numpy())
-            rec_m = ae_decode_latent(ae, ae_encode_latent(ae, xm)["latent"])["recon"]
+            z_moment = ae_encode_latent(ae, xm)["latent"]              # target moment endpoint latent
+            rec_m = ae_decode_latent(ae, z_moment)["recon"]            # moment through VAE (oracle)
             P["moment_vae"] += list(torch.softmax(clf(to224(rec_m)), 1)[:, 1].cpu().numpy())
-            rec_b = ae_decode_latent(ae, reverse(ae_encode_latent(ae, xb)["latent"]))["recon"]
+            z_bbdm = reverse(ae_encode_latent(ae, xb)["latent"])       # BBDM reverse-bridge latent
+            rec_b = ae_decode_latent(ae, z_bbdm)["recon"]              # BBDM output
             P["moment_bbdm"] += list(torch.softmax(clf(to224(rec_b)), 1)[:, 1].cpu().numpy())
-            # fidelity: BBDM decoded vs moment-matched endpoint, both -> [0,1]
-            b01 = (rec_b.clamp(-1, 1) + 1) / 2
-            m01 = (xm + 1) / 2
-            fid_mae += list((b01 - m01).abs().mean(dim=(1, 2, 3)).cpu().numpy())
-            fid_dmu += list((b01.mean(dim=(1, 2, 3)) - m01.mean(dim=(1, 2, 3))).abs().cpu().numpy())
-            fid_dsd += list((b01.std(dim=(1, 2, 3)) - m01.std(dim=(1, 2, 3))).abs().cpu().numpy())
+            # ---- fidelity, decomposed (isolate bridge from VAE) ----
+            B = xb.shape[0]
+            zb, zm = z_bbdm.reshape(B, -1), z_moment.reshape(B, -1)
+            fid_bridge_lat += list(((zb - zm).norm(dim=1) / (zm.norm(dim=1) + 1e-8)).cpu().numpy())
+            b01, m01, v01 = (rec_b.clamp(-1, 1) + 1) / 2, (xm + 1) / 2, (rec_m.clamp(-1, 1) + 1) / 2
+            fid_bridge_img += list((b01 - v01).abs().mean(dim=(1, 2, 3)).cpu().numpy())   # rec_b vs rec_m (both VAE'd)
+            fid_vae_img += list((v01 - m01).abs().mean(dim=(1, 2, 3)).cpu().numpy())      # VAE error alone
+            fid_total_img += list((b01 - m01).abs().mean(dim=(1, 2, 3)).cpu().numpy())    # total
             Y += list(y.numpy()); C += list(c)
 
-    print("\n===== 体级 AUC (mean 聚合, 目标 KneeMRI test) =====")
+    def vol_ci(cases, probs, ys, n_boot=1000, seed=0):
+        d = pd.DataFrame({"case": cases, "p": probs, "y": ys})
+        g = d.groupby("case").agg(p=("p", "mean"), y=("y", "first")).reset_index()
+        base = auc(g.y.values, g.p.values)
+        rng = np.random.RandomState(seed); n = len(g); boots = []
+        for _ in range(n_boot):
+            idx = rng.randint(0, n, n)
+            boots.append(auc(g.y.values[idx], g.p.values[idx]))
+        lo, hi = np.percentile(boots, [2.5, 97.5])
+        return base, lo, hi
+
+    print("\n===== 体级 AUC (mean 聚合, 目标 KneeMRI test, 95% bootstrap CI) =====")
     for k in ["direct_128", "moment_oracle", "moment_vae", "moment_bbdm"]:
-        print("  %-14s %.3f" % (k, vol_mean_auc(C, P[k], Y)))
-    print("\n===== BBDM 到端点的保真度 (越小越好) =====")
-    print("  MAE(bbdm, moment)      = %.4f" % float(np.mean(fid_mae)))
-    print("  |mean(bbdm)-mean(mom)| = %.4f" % float(np.mean(fid_dmu)))
-    print("  |std(bbdm)-std(mom)|   = %.4f" % float(np.mean(fid_dsd)))
-    print("\n判读: 比较 moment_bbdm 与 moment_vae(不是历史 0.795)。")
+        b, lo, hi = vol_ci(C, P[k], Y)
+        print("  %-14s %.3f  [%.3f, %.3f]" % (k, b, lo, hi))
+    print("\n===== 保真度 (拆开桥 vs VAE, 越小越好) =====")
+    print("  bridge_latent_rel  (z_bbdm vs z_moment)   = %.4f   <- 纯桥 latent 误差(最关键)" % float(np.mean(fid_bridge_lat)))
+    print("  bridge_image_MAE   (rec_b vs rec_m)        = %.4f   <- 纯桥图像误差(去掉VAE)" % float(np.mean(fid_bridge_img)))
+    print("  vae_image_MAE      (rec_m vs moment)       = %.4f   <- 单独 VAE 误差" % float(np.mean(fid_vae_img)))
+    print("  total_image_MAE    (rec_b vs moment)       = %.4f   <- 总误差(桥+VAE)" % float(np.mean(fid_total_img)))
+    print("\n判读: moment_bbdm 对比 moment_vae(不是历史 0.795); bridge_latent_rel 小=桥到达端点。")
 
 
 if __name__ == "__main__":

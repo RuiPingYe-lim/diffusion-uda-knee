@@ -197,6 +197,10 @@ class StrictBBDMPairedDataset(Dataset):
             self.length = len(self.df_target)
             self.source_indices_by_label = {}
             self.src_mean, self.src_std = self._compute_source_stats(n=1000)
+            import os as _os, sys as _sys
+            _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+            from source_style_stats import moment_match as _mm
+            self._moment_match = _mm
         else:
             self.length = len(self.df_target)
             if self.source_label_col is None or self.target_label_col is None:
@@ -277,8 +281,7 @@ class StrictBBDMPairedDataset(Dataset):
             t_img_path = _resolve_path(str(t_row[self.target_img_col]), self.target_parent, self.target_root)
             g = np.asarray(Image.open(t_img_path).convert("L").resize((self.image_size, self.image_size)),
                            dtype=np.float32) / 255.0
-            m, s = float(g.mean()), float(g.std()) + 1e-6
-            g_a = np.clip((g - m) / s * self.src_std + self.src_mean, 0.0, 1.0)  # source-styled, same content
+            g_a = self._moment_match(g, self.src_mean, self.src_std)  # source-styled, same content (shared impl)
             x_b = torch.from_numpy(g).unsqueeze(0).float() * 2.0 - 1.0
             x_a = torch.from_numpy(g_a.astype(np.float32)).unsqueeze(0).float() * 2.0 - 1.0
             # NO target label is used in moment_self (endpoints derived purely from the

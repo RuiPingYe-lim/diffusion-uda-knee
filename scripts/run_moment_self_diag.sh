@@ -16,7 +16,7 @@
 #
 # 需要带 GPU 的 autodl 实例。用法: bash run_moment_self_diag.sh
 # ============================================================================
-set -uo pipefail
+set -euo pipefail
 export PATH=/root/miniconda3/bin:$PATH
 export PYTHONPATH=/root/autodl-tmp/knee/code2:${PYTHONPATH:-}
 CODE=/root/autodl-tmp/knee/code2/idea2_diffusion_baseline
