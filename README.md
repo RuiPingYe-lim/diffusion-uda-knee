@@ -54,6 +54,10 @@ src/
     ├── precompute_meanproj.py           # mean-projection preprocessing (paper-1 aligned pipeline)
     ├── train_eval_meanproj.py           # source-only train/eval on mean-projection representation
     └── configs/                          # BBDM / VAE configs (JSON)
+└── unsb/                                 # integration with the external UNSB translator (see below)
+    ├── eval_unsb_translation.py         # classify UNSB translation-only outputs
+    ├── build_unsb_fusion_csv.py         # build fusion CSVs from UNSB outputs
+    └── README.md
 scripts/                                  # one-shot driver scripts (edit paths before use)
 ```
 
@@ -93,9 +97,12 @@ python src/bbdm_strict/fusion_classifier.py --mode eval   ...
 
 ## Notes
 
-- **UNSB comparison**: newer unpaired translation (Neural Schrödinger Bridge) was compared against BBDM
-  using the external repo [cyclomon/UNSB](https://github.com/cyclomon/UNSB); only our integration/eval
-  scripts (`scripts/run_unsb_*.sh`) are included here, not the UNSB code itself.
+- **UNSB comparison** (`src/unsb/`): a newer, sharper unpaired translator — Unpaired Neural Schrödinger
+  Bridge — was compared against BBDM. **UNSB itself is an external repo**
+  ([cyclomon/UNSB](https://github.com/cyclomon/UNSB)) and is **not vendored here**; `src/unsb/` contains
+  only our integration (translation-only eval, fusion-CSV builder) and the drivers are
+  `scripts/run_unsb_*.sh`. Finding: UNSB images look much better than BBDM, but downstream AUC did not
+  improve — image quality and discriminative usefulness are decoupled. See `src/unsb/README.md`.
 - **Pipeline alignment**: `precompute_meanproj.py` / `train_eval_meanproj.py` reproduce the first paper's
   mean-projection representation so both papers share one benchmark.
 - Configs/scripts contain **absolute paths** — edit them for your environment.
