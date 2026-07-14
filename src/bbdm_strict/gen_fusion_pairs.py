@@ -11,6 +11,16 @@
 目标域(BrEaST/KneeMRI test)       -> 评估
 两边用同一个 BBDM、同样的处理。
 
+⚠️ 已知问题 (C5, 分布不对称):
+  BBDM 是 target->source 桥, 训练时反向起点 x_B = 目标域 latent。
+  这里对源域图也用同一个反向桥来生成"融合训练视图", 但源图作为反向起点
+  属于 off-distribution -> 若 BBDM 用随机端点(label_random)训练, 源域"翻译视图"
+  会退化/异常, 与测试时真正的目标->源翻译分布不同, 融合分类器于是学会忽略翻译视图
+  (这正是"融合提升几乎全来自原图"的原因)。
+  缓解: 必须搭配 pair_mode='moment_self' 训练的 CONTENT-PRESERVING 桥(见
+  datasets_strict_bbdm.py), 它学的是"保内容、只改风格"的映射, 对源图近似恒等、
+  在分布内。根本解决需改为"源->目标 任务保持增强"(训练/测试同分布)。
+
 用法：
   python gen_fusion_pairs.py --config <bbdm_cfg.json> --checkpoint <bbdm latest.pt> \
     --input_csv <带image_path,label的csv> --out_dir <输出目录> \

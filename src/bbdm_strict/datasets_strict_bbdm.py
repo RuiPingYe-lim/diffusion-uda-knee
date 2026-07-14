@@ -126,10 +126,17 @@ class StrictBBDMPairedDataset(Dataset):
     - paired_csv: source/target rows are index-aligned pairs.
     - label_random: class-consistent pseudo-pairing fallback, target(label=y)
       matched with random source(label=y).
+    - moment_self: CONTENT-PRESERVING endpoints. For each target image x_B,
+      x_A is the SAME image moment-matched to the source-domain global intensity
+      statistics (mean/std). The two bridge endpoints are structurally identical
+      and differ only in style, so the bridge learns a pure style map that keeps
+      the case's discriminative content. This is the diagnostic that isolates
+      whether random (content-mismatched) endpoints were the cause of poor results.
 
     Important:
-    - label_random is pseudo-paired/class-consistent pairing,
-      not official fully paired BBDM data.
+    - label_random is pseudo-paired/class-consistent pairing (endpoints share only
+      a label, NOT content) -> not official paired BBDM data; the bridge is forced
+      to change anatomy, which harms content preservation.
     - Optional pair-cache can freeze target->source mapping within an epoch and
       reshuffle on epoch boundary with deterministic seed control.
     """
@@ -164,8 +171,8 @@ class StrictBBDMPairedDataset(Dataset):
         self._pair_map: Dict[int, int] = {}
         self._pair_epoch = -1
 
-        if self.pair_mode not in {"paired_csv", "label_random"}:
-            raise ValueError("pair_mode must be 'paired_csv' or 'label_random'")
+        if self.pair_mode not in {"paired_csv", "label_random", "moment_self"}:
+            raise ValueError("pair_mode must be 'paired_csv', 'label_random' or 'moment_self'")
 
         self.df_source = pd.read_csv(self.source_csv)
         self.df_target = pd.read_csv(self.target_csv)
@@ -185,6 +192,11 @@ class StrictBBDMPairedDataset(Dataset):
         if self.pair_mode == "paired_csv":
             self.length = min(len(self.df_source), len(self.df_target))
             self.source_indices_by_label: Dict[int, list[int]] = {}
+        elif self.pair_mode == "moment_self":
+            # Content-preserving endpoints derived from the target image itself.
+            self.length = len(self.df_target)
+            self.source_indices_by_label = {}
+            self.src_mean, self.src_std = self._compute_source_stats(n=1000)
         else:
             self.length = len(self.df_target)
             if self.source_label_col is None or self.target_label_col is None:
@@ -200,6 +212,21 @@ class StrictBBDMPairedDataset(Dataset):
             self.source_indices_by_label = groups
             if self.use_pair_cache:
                 self.set_epoch(0)
+
+    def _compute_source_stats(self, n: int = 1000):
+        """Global (mean, std) of source-domain images in [0,1] for moment matching."""
+        rng = random.Random(self.seed)
+        idxs = rng.sample(range(len(self.df_source)), min(n, len(self.df_source)))
+        s_sum = s_sq = cnt = 0.0
+        for i in idxs:
+            r = self.df_source.iloc[i]
+            p = _resolve_path(str(r[self.source_img_col]), self.source_parent, self.source_root)
+            g = np.asarray(Image.open(p).convert("L").resize((self.image_size, self.image_size)),
+                           dtype=np.float32) / 255.0
+            s_sum += float(g.sum()); s_sq += float((g ** 2).sum()); cnt += g.size
+        mean = s_sum / cnt
+        std = float(np.sqrt(max(s_sq / cnt - mean ** 2, 1e-8)))
+        return float(mean), std
 
     def __len__(self) -> int:
         return self.length
@@ -249,6 +276,22 @@ class StrictBBDMPairedDataset(Dataset):
         t_idx = idx % len(self.df_target)
         t_row = self.df_target.iloc[t_idx]
         target_label = int(t_row[self.target_label_col]) if self.target_label_col and pd.notna(t_row[self.target_label_col]) else -1
+
+        if self.pair_mode == "moment_self":
+            # x_B = target image; x_A = SAME image moment-matched to source style.
+            t_img_path = _resolve_path(str(t_row[self.target_img_col]), self.target_parent, self.target_root)
+            g = np.asarray(Image.open(t_img_path).convert("L").resize((self.image_size, self.image_size)),
+                           dtype=np.float32) / 255.0
+            m, s = float(g.mean()), float(g.std()) + 1e-6
+            g_a = np.clip((g - m) / s * self.src_std + self.src_mean, 0.0, 1.0)  # source-styled, same content
+            x_b = torch.from_numpy(g).unsqueeze(0).float() * 2.0 - 1.0
+            x_a = torch.from_numpy(g_a.astype(np.float32)).unsqueeze(0).float() * 2.0 - 1.0
+            return {
+                "x_A": x_a, "x_B": x_b,
+                "label": target_label, "source_label": target_label, "target_label": target_label,
+                "source_path": str(t_img_path), "target_path": str(t_img_path),
+                "pair_mode": self.pair_mode, "pair_epoch": int(self._pair_epoch),
+            }
 
         s_idx = self._pick_source_index(t_idx, target_label)
         s_row = self.df_source.iloc[s_idx]

@@ -24,7 +24,7 @@
       --label_col label --out_dir .../fusion_run
 """
 from __future__ import annotations
-import argparse, os
+import argparse, os, random
 import numpy as np, pandas as pd, torch
 import torch.nn as nn
 import torchvision.transforms as T
@@ -41,8 +41,12 @@ class MultiImageDataset(Dataset):
         self.bc = before_col
         self.others = [c.strip() for c in other_cols if c.strip()]
         self.lc = label_col
-        aug = [T.RandomHorizontalFlip()] if is_train else []
-        self.tf = T.Compose(aug + [
+        self.is_train = bool(is_train)
+        # Deterministic transform. Geometric augmentation (horizontal flip) is applied
+        # in __getitem__ with a SINGLE shared decision so all views (before + others)
+        # stay geometrically aligned -- otherwise cross-attention attends across
+        # mirror-mismatched token grids (fix for the independent-flip bug).
+        self.tf = T.Compose([
             T.ToTensor(), T.Resize((resize, resize), antialias=True),
             T.Lambda(lambda t: t.repeat(3, 1, 1) if t.shape[0] == 1 else t),
             T.Normalize([0.5] * 3, [0.5] * 3),
@@ -50,12 +54,17 @@ class MultiImageDataset(Dataset):
 
     def __len__(self): return len(self.df)
 
-    def _load(self, p): return self.tf(Image.open(p).convert("L"))
+    def _load(self, p, do_flip=False):
+        im = Image.open(p).convert("L")
+        if do_flip:
+            im = im.transpose(Image.FLIP_LEFT_RIGHT)
+        return self.tf(im)
 
     def __getitem__(self, i):
         r = self.df.iloc[i]
-        before = self._load(r[self.bc])
-        others = torch.stack([self._load(r[c]) for c in self.others])  # [K, 3, H, W]
+        do_flip = self.is_train and (random.random() < 0.5)  # one decision, shared by all views
+        before = self._load(r[self.bc], do_flip)
+        others = torch.stack([self._load(r[c], do_flip) for c in self.others])  # [K, 3, H, W]
         case = str(r["case_id"]) if "case_id" in self.df.columns else str(i)
         return before, others, int(float(r[self.lc])), case
 
