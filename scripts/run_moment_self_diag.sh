@@ -39,6 +39,7 @@ python eval_moment_self_oracle.py \
   --slice_csv $AS/kneemri_test/allslices.csv \
   --source_csv $AS/mrnet_train/allslices.csv \
   --bbdm_config $CFG --bbdm_ckpt $BCK \
-  --num_inference_steps 50 --image_size 128 --n_ref 1000 --seed 42
+  --num_inference_steps 50 --image_size 128 --n_ref 1000 --seed 42 \
+  --n_boot 2000 --equiv_margin 0.02 --out_csv $AS/moment_self_oracle_percase.csv
 
 echo "MOMENT_SELF_DIAG_DONE $(date)"

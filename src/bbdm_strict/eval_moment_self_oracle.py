@@ -97,6 +97,9 @@ def main():
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--n_ref", type=int, default=1000)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--n_boot", type=int, default=2000)
+    ap.add_argument("--equiv_margin", type=float, default=0.02, help="|Δbridge| CI within this = bbdm≈vae")
+    ap.add_argument("--out_csv", default="", help="save per-case probs + fidelity")
     a = ap.parse_args()
     dev = torch.device("cuda")
     cfg = json.load(open(a.bbdm_config, encoding="utf-8"))
@@ -109,9 +112,14 @@ def main():
     ck = torch.load(a.clf_ckpt, map_location=dev, weights_only=False)
     sd = ck.get("state_dict", ck.get("model", ck))
     res = clf.load_state_dict({k.replace("module.", ""): v for k, v in sd.items()}, strict=False)
-    print("[clf load] missing=%d unexpected=%d" % (len(res.missing_keys), len(res.unexpected_keys)))
-    if res.missing_keys:
-        print("  missing:", res.missing_keys[:8])
+    # fail-fast: only the (disabled) rsa module keys may be ignored; anything else means the
+    # classifier head/backbone did not load -> AUCs would be meaningless.
+    bad_missing = [k for k in res.missing_keys if "rsa" not in k.lower()]
+    bad_unexpected = [k for k in res.unexpected_keys if "rsa" not in k.lower()]
+    print("[clf load] missing=%d unexpected=%d (rsa keys ignored)" % (len(res.missing_keys), len(res.unexpected_keys)))
+    if bad_missing or bad_unexpected:
+        raise RuntimeError("classifier weights did not load cleanly: "
+                           f"missing(non-rsa)={bad_missing[:8]} unexpected(non-rsa)={bad_unexpected[:8]}")
     clf.to(dev).eval()
 
     ae = load_ae_model(cfg["ae_ckpt"], cfg.get("ae_config"), device=dev, freeze=True)
@@ -162,27 +170,72 @@ def main():
             fid_total_img += list((b01 - m01).abs().mean(dim=(1, 2, 3)).cpu().numpy())    # total
             Y += list(y.numpy()); C += list(c)
 
-    def vol_ci(cases, probs, ys, n_boot=1000, seed=0):
-        d = pd.DataFrame({"case": cases, "p": probs, "y": ys})
-        g = d.groupby("case").agg(p=("p", "mean"), y=("y", "first")).reset_index()
-        base = auc(g.y.values, g.p.values)
-        rng = np.random.RandomState(seed); n = len(g); boots = []
-        for _ in range(n_boot):
-            idx = rng.randint(0, n, n)
-            boots.append(auc(g.y.values[idx], g.p.values[idx]))
-        lo, hi = np.percentile(boots, [2.5, 97.5])
-        return base, lo, hi
+    # ---- per-case aggregation (mean over slices) ----
+    df = pd.DataFrame({"case": C, "y": Y,
+                       "p_direct": P["direct_128"], "p_moment": P["moment_oracle"],
+                       "p_moment_vae": P["moment_vae"], "p_moment_bbdm": P["moment_bbdm"],
+                       "bridge_latent_rel": fid_bridge_lat, "bridge_image_mae": fid_bridge_img,
+                       "vae_image_mae": fid_vae_img, "total_image_mae": fid_total_img})
+    g = df.groupby("case").agg(
+        y=("y", "first"),
+        p_direct=("p_direct", "mean"), p_moment=("p_moment", "mean"),
+        p_moment_vae=("p_moment_vae", "mean"), p_moment_bbdm=("p_moment_bbdm", "mean"),
+        bridge_latent_rel=("bridge_latent_rel", "mean"), bridge_image_mae=("bridge_image_mae", "mean"),
+        vae_image_mae=("vae_image_mae", "mean"), total_image_mae=("total_image_mae", "mean"),
+    ).reset_index()
+    yv = g["y"].values
+    cols = {"direct_128": "p_direct", "moment_oracle": "p_moment",
+            "moment_vae": "p_moment_vae", "moment_bbdm": "p_moment_bbdm"}
+    base = {k: auc(yv, g[v].values) for k, v in cols.items()}
 
-    print("\n===== 体级 AUC (mean 聚合, 目标 KneeMRI test, 95% bootstrap CI) =====")
-    for k in ["direct_128", "moment_oracle", "moment_vae", "moment_bbdm"]:
-        b, lo, hi = vol_ci(C, P[k], Y)
-        print("  %-14s %.3f  [%.3f, %.3f]" % (k, b, lo, hi))
-    print("\n===== 保真度 (拆开桥 vs VAE, 越小越好) =====")
-    print("  bridge_latent_rel  (z_bbdm vs z_moment)   = %.4f   <- 纯桥 latent 误差(最关键)" % float(np.mean(fid_bridge_lat)))
-    print("  bridge_image_MAE   (rec_b vs rec_m)        = %.4f   <- 纯桥图像误差(去掉VAE)" % float(np.mean(fid_bridge_img)))
-    print("  vae_image_MAE      (rec_m vs moment)       = %.4f   <- 单独 VAE 误差" % float(np.mean(fid_vae_img)))
-    print("  total_image_MAE    (rec_b vs moment)       = %.4f   <- 总误差(桥+VAE)" % float(np.mean(fid_total_img)))
-    print("\n判读: moment_bbdm 对比 moment_vae(不是历史 0.795); bridge_latent_rel 小=桥到达端点。")
+    # ---- PAIRED case-level bootstrap (shared indices; skip single-class resamples) ----
+    rng = np.random.RandomState(a.seed); n = len(g)
+    boot = {k: [] for k in cols}
+    d_bridge, d_vae, d_gain = [], [], []
+    kept = 0
+    for _ in range(a.n_boot):
+        idx = rng.randint(0, n, n)
+        yb = yv[idx]
+        if yb.sum() == 0 or yb.sum() == len(yb):
+            continue
+        kept += 1
+        av = {k: auc(yb, g[v].values[idx]) for k, v in cols.items()}
+        for k in cols:
+            boot[k].append(av[k])
+        d_bridge.append(av["moment_bbdm"] - av["moment_vae"])
+        d_vae.append(av["moment_vae"] - av["moment_oracle"])
+        d_gain.append(av["moment_bbdm"] - av["direct_128"])
+
+    def ci(x):
+        x = np.asarray(x, dtype=float)
+        return float(np.percentile(x, 2.5)), float(np.percentile(x, 97.5))
+
+    print("\n===== 体级 AUC (mean 聚合, n_vol=%d, %d/%d bootstrap 有效) =====" % (n, kept, a.n_boot))
+    for k in cols:
+        lo, hi = ci(boot[k])
+        print("  %-14s %.3f  [%.3f, %.3f]" % (k, base[k], lo, hi))
+
+    print("\n===== 配对 ΔAUC (同一 bootstrap 重采样, 95% CI) =====")
+    for name, d, desc in [("Δbridge = bbdm-vae", d_bridge, "桥是否到达 VAE 端点"),
+                          ("Δvae    = vae-oracle", d_vae, "VAE 造成的损失"),
+                          ("Δgain   = bbdm-direct", d_gain, "整体相对直接迁移")]:
+        lo, hi = ci(d)
+        print("  %-22s %+.3f  [%+.3f, %+.3f]   %s" % (name, float(np.mean(d)), lo, hi, desc))
+    lo_b, hi_b = ci(d_bridge)
+    equiv = (lo_b >= -a.equiv_margin) and (hi_b <= a.equiv_margin)
+    print("  等价判定 (|Δbridge| 95%%CI ⊂ [-%.2f, %.2f]): %s"
+          % (a.equiv_margin, a.equiv_margin, "是 -> 桥≈VAE端点" if equiv else "否"))
+
+    print("\n===== 保真度 (拆开桥 vs VAE, 病例级均值, 越小越好) =====")
+    print("  bridge_latent_rel  (z_bbdm vs z_moment) = %.4f   <- 纯桥 latent 误差(最关键)" % float(g["bridge_latent_rel"].mean()))
+    print("  bridge_image_MAE   (rec_b vs rec_m)      = %.4f   <- 纯桥图像误差(去 VAE)" % float(g["bridge_image_mae"].mean()))
+    print("  vae_image_MAE      (rec_m vs moment)     = %.4f   <- 单独 VAE 误差" % float(g["vae_image_mae"].mean()))
+    print("  total_image_MAE    (rec_b vs moment)     = %.4f   <- 总误差" % float(g["total_image_mae"].mean()))
+
+    if a.out_csv:
+        g.to_csv(a.out_csv, index=False)
+        print("\n病例级结果已保存:", a.out_csv)
+    print("\n判读: 用 Δbridge 的 CI(不是历史 0.795); Δbridge≈0 且 bridge_latent_rel 小 -> 桥到达端点。")
 
 
 if __name__ == "__main__":

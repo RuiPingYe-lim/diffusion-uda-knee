@@ -356,19 +356,6 @@ def _ae_feat_consistency_loss(ae_model: AEUNet, x_pred: torch.Tensor, x_ref: tor
 def main() -> None:
     args = parse_args()
     cfg = load_config(args)
-
-    # Fail-fast: moment_self is a content-preserving diagnostic. SupCon would treat all
-    # label=-1 endpoints as one class, and the pixel self-preservation losses pull the output
-    # back toward the ORIGINAL target style, fighting the style change the bridge must learn.
-    # Both would confound the root-cause diagnostic, so require them off.
-    if str(cfg.get("pair_mode", "")).lower() == "moment_self":
-        forbidden = ["lambda_supcon", "lambda_self_l1", "lambda_self_ssim", "lambda_self_edge"]
-        active = {k: cfg.get(k) for k in forbidden if float(cfg.get(k, 0) or 0) != 0.0}
-        if active:
-            raise ValueError(
-                f"pair_mode='moment_self' requires {forbidden} = 0 (self-preservation/SupCon "
-                f"losses confound the diagnostic), but these are active: {active}")
-
     set_seed(int(cfg["seed"]))
 
     run_dir = Path(cfg["run_root"]) / str(cfg["exp_name"])
@@ -377,6 +364,24 @@ def main() -> None:
 
     eff = _resolve_effective_lambdas(cfg)
     cfg.update(eff)
+
+    # Fail-fast for the PURE moment_self C1 diagnostic: after resolving effective lambdas
+    # (which have NON-ZERO defaults, e.g. self_l1=1.0, feat_src=0.05), require that EVERY
+    # lambda_* is exactly 0 so only the Brownian-bridge loss is active. This is stricter and
+    # more robust than listing a few forbidden keys (which could miss latent_recon/source_recon/
+    # feat_src/style_src/content/edge folded in by _resolve_effective_lambdas).
+    if str(cfg.get("pair_mode", "")).lower() == "moment_self":
+        def _f(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return 0.0
+        active = {k: v for k, v in cfg.items() if k.startswith("lambda_") and _f(v) != 0.0}
+        if active:
+            raise ValueError(
+                "pair_mode='moment_self' is a PURE content-preserving diagnostic and requires "
+                f"ALL lambda_* = 0 (only the bridge loss active), but these are nonzero: {active}. "
+                "Use configs/bbdm_knee_moment_self_pure.json.")
 
     use_ae_frontend = _as_bool(cfg.get("use_ae_frontend", 0))
     ae_freeze = _as_bool(cfg.get("ae_freeze", 1))
@@ -524,6 +529,7 @@ def main() -> None:
                 batch_size=bsz,
                 num_train_timesteps=int(cfg["num_train_timesteps"]),
                 device=device,
+                endpoint_frac=float(cfg.get("endpoint_frac", 0.1)),
             )
             eps = torch.randn_like(x_a_bridge)
 
