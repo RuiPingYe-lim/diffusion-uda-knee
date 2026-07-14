@@ -214,19 +214,14 @@ class StrictBBDMPairedDataset(Dataset):
                 self.set_epoch(0)
 
     def _compute_source_stats(self, n: int = 1000):
-        """Global (mean, std) of source-domain images in [0,1] for moment matching."""
-        rng = random.Random(self.seed)
-        idxs = rng.sample(range(len(self.df_source)), min(n, len(self.df_source)))
-        s_sum = s_sq = cnt = 0.0
-        for i in idxs:
-            r = self.df_source.iloc[i]
-            p = _resolve_path(str(r[self.source_img_col]), self.source_parent, self.source_root)
-            g = np.asarray(Image.open(p).convert("L").resize((self.image_size, self.image_size)),
-                           dtype=np.float32) / 255.0
-            s_sum += float(g.sum()); s_sq += float((g ** 2).sum()); cnt += g.size
-        mean = s_sum / cnt
-        std = float(np.sqrt(max(s_sq / cnt - mean ** 2, 1e-8)))
-        return float(mean), std
+        """Global (mean, std) of source-domain images in [0,1] for moment matching.
+        Uses the shared, cached stats module so the moment_self dataset and the
+        Oracle evaluation read IDENTICAL statistics (same n/seed/image_size)."""
+        import os as _os, sys as _sys
+        _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+        from source_style_stats import get_source_stats
+        return get_source_stats(self.source_csv, image_col=self.source_img_col,
+                                image_size=self.image_size, n=n, seed=self.seed)
 
     def __len__(self) -> int:
         return self.length
@@ -286,9 +281,12 @@ class StrictBBDMPairedDataset(Dataset):
             g_a = np.clip((g - m) / s * self.src_std + self.src_mean, 0.0, 1.0)  # source-styled, same content
             x_b = torch.from_numpy(g).unsqueeze(0).float() * 2.0 - 1.0
             x_a = torch.from_numpy(g_a.astype(np.float32)).unsqueeze(0).float() * 2.0 - 1.0
+            # NO target label is used in moment_self (endpoints derived purely from the
+            # target image + source-domain global stats). Return -1 so nothing downstream
+            # can leak a target training label; SupCon must be disabled in this mode.
             return {
                 "x_A": x_a, "x_B": x_b,
-                "label": target_label, "source_label": target_label, "target_label": target_label,
+                "label": -1, "source_label": -1, "target_label": -1,
                 "source_path": str(t_img_path), "target_path": str(t_img_path),
                 "pair_mode": self.pair_mode, "pair_epoch": int(self._pair_epoch),
             }

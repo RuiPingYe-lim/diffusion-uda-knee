@@ -155,7 +155,7 @@ def main():
     ap.add_argument("--backbone", default="resnet50", choices=["resnet50", "resnet18"])
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
-    torch.manual_seed(a.seed); np.random.seed(a.seed)
+    torch.manual_seed(a.seed); np.random.seed(a.seed); random.seed(a.seed)
     others = a.other_cols.split(",")
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = CrossAttnFusionClassifier(backbone=a.backbone).to(dev)

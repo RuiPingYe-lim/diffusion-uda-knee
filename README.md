@@ -51,9 +51,11 @@ src/
     ├── eval_partial_translate.py        # partial-translation (t0) sweep
     ├── eval_freqmix.py                  # frequency-decoupled translation prototype
     ├── eval_late_fusion.py              # decision-level ensemble
+    ├── source_style_stats.py            # shared, cached source intensity stats (moment matching)
+    ├── eval_moment_self_oracle.py       # C1 diagnostic: direct/moment/moment+VAE/BBDM oracle + fidelity
     ├── precompute_meanproj.py           # mean-projection preprocessing (paper-1 aligned pipeline)
     ├── train_eval_meanproj.py           # source-only train/eval on mean-projection representation
-    └── configs/                          # BBDM / VAE configs (JSON)
+    └── configs/                          # BBDM / VAE configs (JSON; incl. moment_self diagnostics)
 └── unsb/                                 # integration with the external UNSB translator (see below)
     ├── eval_unsb_translation.py         # classify UNSB translation-only outputs
     ├── build_unsb_fusion_csv.py         # build fusion CSVs from UNSB outputs
@@ -79,9 +81,11 @@ Config JSONs and scripts contain **absolute paths that must be edited** to your 
 ## Typical workflow
 
 ```bash
-# 1. train KL-VAE
-python src/vqgan_pretrain/train_vqgan.py   --config <klvae_config.json>
-# 2. train BBDM (uses the frozen VAE)
+# 1. train the autoencoder (VQGAN / AE-UNet). NOTE: the committed train_vqgan.py
+#    supports model_type in {vq, ae_unet}. A KLVAE class exists in models_vqgan.py
+#    but its training entrypoint is not yet wired into train_vqgan.py (WIP).
+python src/vqgan_pretrain/train_vqgan.py   --config <ae_config.json>
+# 2. train BBDM (uses the frozen AE)
 python src/bbdm_strict/train_strict_bbdm.py --config src/bbdm_strict/configs/bbdm_knee_allslices.json
 # 3. translate target + volume-level AUC
 python src/bbdm_strict/eval_volume.py --mode translate --clf_ckpt <cls.pt> \
@@ -95,6 +99,26 @@ python src/bbdm_strict/fusion_classifier.py --mode train  ...
 python src/bbdm_strict/fusion_classifier.py --mode eval   ...
 ```
 
+## C1 root-cause diagnostic (moment_self)
+
+An external review found the default BBDM pairing (`label_random`) pairs each target slice with a
+**content-random same-class source slice**, so the bridge endpoints share only a label — the model is
+forced to change anatomy, not just style. To isolate whether that pairing is the cause of poor
+translation, use the content-preserving `moment_self` mode (bridge endpoints = the SAME target image,
+`x_A` = that image moment-matched to source style) with the **pure** config (only the bridge loss):
+
+```bash
+# train pure moment_self BBDM + Oracle eval (4 reference points + fidelity)
+bash scripts/run_moment_self_diag.sh
+# or manually:
+python src/bbdm_strict/train_strict_bbdm.py --config src/bbdm_strict/configs/bbdm_knee_moment_self_pure.json
+python src/bbdm_strict/eval_moment_self_oracle.py --clf_ckpt <cls.pt> \
+    --slice_csv <target_test.csv> --source_csv <source_train.csv> \
+    --bbdm_config <moment_self_pure.json> --bbdm_ckpt <bbdm.pt>
+```
+Compare `moment_bbdm` against the `moment_vae` oracle (NOT against historical numbers). Shared source
+intensity stats come from `source_style_stats.py` (cached) so all scripts use identical statistics.
+
 ## Notes
 
 - **UNSB comparison** (`src/unsb/`): a newer, sharper unpaired translator — Unpaired Neural Schrödinger
@@ -103,6 +127,14 @@ python src/bbdm_strict/fusion_classifier.py --mode eval   ...
   only our integration (translation-only eval, fusion-CSV builder) and the drivers are
   `scripts/run_unsb_*.sh`. Finding: UNSB images look much better than BBDM, but downstream AUC did not
   improve — image quality and discriminative usefulness are decoupled. See `src/unsb/README.md`.
-- **Pipeline alignment**: `precompute_meanproj.py` / `train_eval_meanproj.py` reproduce the first paper's
-  mean-projection representation so both papers share one benchmark.
+- **Pipeline alignment (partial)**: `precompute_meanproj.py` builds the first paper's mean-projection
+  images and `train_eval_meanproj.py` trains a **source-only classifier** on them (to reproduce the
+  paper-1 Source-Only baseline). The **BBDM pipeline itself still runs per-slice** (`allslices`
+  configs); fully porting BBDM onto the mean-projection representation is not yet done.
+- **Known limitations / WIP** (tracked from code review): `train_vqgan.py` does not yet wire the KLVAE
+  training path; several `eval_*` scripts sweep hyper-parameters on target-test labels (exploratory
+  only — final results must fix params in advance); the cross-attention fusion mixes source "other
+  views" produced by a target→source bridge (distribution mismatch — pending a source→target
+  augmentation redesign, see `gen_fusion_pairs.py`); SupCon uses a low-dim latent mean (should use
+  deep classifier features). See the commit history for fixes in progress.
 - Configs/scripts contain **absolute paths** — edit them for your environment.

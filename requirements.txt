@@ -1,8 +1,10 @@
 torch>=2.0
 torchvision>=0.15
+diffusers>=0.21
 numpy
 pandas
 pillow
 scipy
 matplotlib
 lpips
+tqdm
