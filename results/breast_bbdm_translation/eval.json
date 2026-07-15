@@ -1,0 +1,24 @@
+{
+  "n_cases": 201,
+  "n_pos": 78,
+  "n_neg": 123,
+  "auc_before_128": 0.791,
+  "auc_ae_recon": 0.7741,
+  "auc_translated": 0.4946,
+  "CI_translated_minus_before": {
+    "lo": -0.4019,
+    "hi": -0.1918,
+    "boot_mean": -0.2961
+  },
+  "CI_translated_minus_ae_recon": {
+    "lo": -0.3759,
+    "hi": -0.174,
+    "boot_mean": -0.2794
+  },
+  "CI_ae_recon_minus_before": {
+    "lo": -0.0554,
+    "hi": 0.0257,
+    "boot_mean": -0.0167
+  },
+  "decision": "translated-before Delta=-0.2964 <= 0 -> no gain from BBDM translation"
+}
