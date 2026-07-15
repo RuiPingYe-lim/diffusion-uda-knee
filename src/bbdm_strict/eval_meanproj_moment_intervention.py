@@ -1,5 +1,11 @@
 #!/usr/bin/env python
-"""Mean-projection Oracle audit — Round-1 gate for the knee C2 path hypothesis.
+"""Mean-projection FIXED MOMENT-INTERVENTION probe (renamed from "Oracle audit").
+
+NOTE (review): this is NOT an oracle / upper bound for C2 -- it measures
+AUC(f_frozen(M(x_target))) for a fixed first/second-moment transform M, which is
+a different classifier/training/transform-direction than C2. A null here bounds
+only THIS fixed intervention, not arbitrary appearance-translation methods.
+
 
 Uses an EXISTING source-only ('none') classifier — NO retraining — to compare,
 on the SAME mean-projection target test set that produced the reported number:
@@ -252,6 +258,7 @@ def main() -> None:
     ap.add_argument("--expect_direct_auc", type=float, default=0.7281,
                     help="direct-arm reproduction target; a mismatch beyond --direct_auc_tol VOIDS the audit")
     ap.add_argument("--direct_auc_tol", type=float, default=0.005)
+    ap.add_argument("--mcid", type=float, default=0.03, help="minimum clinically important delta-AUC (futility = CI upper < mcid)")
     ap.add_argument("--out_csv", type=Path, default=None)
     ap.add_argument("--out_json", type=Path, default=None)
     ap.add_argument("--device", type=str, default="cuda")
@@ -306,7 +313,11 @@ def main() -> None:
     tgt_m = df["tgt_mean"].to_numpy(float); tgt_s = df["tgt_std"].to_numpy(float)
     gap_mean = float(abs(src_m.mean() - tgt_m.mean()))
     gap_std = float(abs(src_s.mean() - tgt_s.mean()))
-    gap_mean_in_srcstd = float(gap_mean / (s_std + 1e-6))
+    # FIX (review): standardize the cross-domain MEAN gap by the pooled BETWEEN-CASE
+    # SD of per-image means -- NOT the within-image pooled pixel std (s_std), which
+    # is a different quantity and understated the gap in the original writeup.
+    xcase_sd = float(np.sqrt((src_m.std() ** 2 + tgt_m.std() ** 2) / 2.0))
+    gap_mean_in_srcstd = float(gap_mean / (xcase_sd + 1e-9))
     mm_mae = float(df["mm_mae"].mean())
     clip_frac = float(df["mm_clip_frac"].mean())
     # closure of the intensity gap toward the source, using ACTUAL post-clip
@@ -328,19 +339,23 @@ def main() -> None:
         direct_diff = float(abs(auc_direct - float(args.expect_direct_auc)))
         direct_ok = direct_diff <= float(args.direct_auc_tol)
 
-    # --- verdict --------------------------------------------------------------
+    # --- verdict (review: futility = CI UPPER bound below the MCID, NOT "CI crosses 0") -----
+    # MCID = minimum clinically important difference (preset effect size, e.g. 0.03).
+    # PROCEED  : ci_lo > 0 AND delta >= MCID   (effect is real and >= MCID)
+    # STOP     : ci_hi < MCID                  (can rule OUT a meaningful effect -> futile)
+    # INCONCL. : otherwise                     (CI spans the MCID -> undecided; get more data)
     ci_lo, ci_hi = boot["delta_ci_lo"], boot["delta_ci_hi"]
-    ci_crosses_0 = not (ci_lo > 0 or ci_hi < 0)
+    MCID = float(args.mcid)
     if not direct_ok:
         verdict = (f"VOID: direct arm did NOT reproduce expected {args.expect_direct_auc} "
                    f"(got {auc_direct:.4f}, |d|={direct_diff:.4f} > tol {args.direct_auc_tol}); "
                    "preprocessing/checkpoint diverges from training -> audit invalid, ignore delta.")
-    elif delta < 0.01 or ci_crosses_0:
-        verdict = "STOP: no usable appearance lever on mean-proj -> end knee C2 (no Round 2)."
-    elif delta >= 0.03 and ci_lo > 0:
-        verdict = "PROCEED: appearance lever survives -> Round 2 (CE-only, no Brownian) allowed."
+    elif ci_lo > 0 and delta >= MCID:
+        verdict = f"PROCEED: effect real and >= MCID={MCID} (ci_lo={ci_lo:.3f}>0)."
+    elif ci_hi < MCID:
+        verdict = f"STOP (futility): CI upper {ci_hi:.3f} < MCID={MCID} -> can rule out a meaningful effect."
     else:
-        verdict = "WEAK/AMBIGUOUS: 0.01<=delta<0.03 or CI marginal -> not a clean pass; treat as STOP."
+        verdict = f"INCONCLUSIVE: CI [{ci_lo:.3f},{ci_hi:.3f}] spans MCID={MCID} -> undecided, need more cases/folds."
 
     summary = {
         "auc_direct": round(auc_direct, 4),
