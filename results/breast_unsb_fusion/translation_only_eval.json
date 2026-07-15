@@ -1,0 +1,49 @@
+{
+  "n_cases": 201,
+  "n_pos": 78,
+  "n_neg": 123,
+  "auc": {
+    "direct": 0.791,
+    "real": 0.7833,
+    "fake_1": 0.7302,
+    "fake_2": 0.7048,
+    "fake_3": 0.6995,
+    "fake_4": 0.6988,
+    "fake_5": 0.6915
+  },
+  "expect_direct_auc": 0.7909,
+  "direct_reproduced": true,
+  "ref_arm": "real",
+  "paired_CI_vs_ref": {
+    "fake_1": {
+      "boot_mean": -0.0529,
+      "lo": -0.1127,
+      "hi": 0.004
+    },
+    "fake_2": {
+      "boot_mean": -0.0788,
+      "lo": -0.1406,
+      "hi": -0.0194
+    },
+    "fake_3": {
+      "boot_mean": -0.0846,
+      "lo": -0.15,
+      "hi": -0.0226
+    },
+    "fake_4": {
+      "boot_mean": -0.0854,
+      "lo": -0.1522,
+      "hi": -0.0187
+    },
+    "fake_5": {
+      "boot_mean": -0.0927,
+      "lo": -0.1625,
+      "hi": -0.0244
+    },
+    "real_minus_direct": {
+      "boot_mean": -0.0075,
+      "lo": -0.0223,
+      "hi": 0.0061
+    }
+  }
+}
