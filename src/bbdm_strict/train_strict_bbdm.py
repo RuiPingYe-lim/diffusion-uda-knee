@@ -79,6 +79,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--lambda_delta_reg", type=float, default=None)
     ap.add_argument("--save_ae_vis", type=int, default=None)
     ap.add_argument("--lambda_latent_recon", type=float, default=None)
+    # 建议4 消融开关: 源域全局强度统计(均值/对比度)作为条件先验, 用损失约束生成图. 0=关(基线)
+    ap.add_argument("--lambda_stat_prior", type=float, default=None)
     return ap.parse_args()
 
 
@@ -134,6 +136,7 @@ def _default_config() -> Dict[str, Any]:
         "lambda_delta_reg": 0.0,
         "save_ae_vis": 0,
         "lambda_latent_recon": 1.0,
+        "lambda_stat_prior": 0.0,
     }
 
 
@@ -315,6 +318,25 @@ def _style_stats_loss(
         losses.append(F.l1_loss(mu_p, mu_s) + F.l1_loss(std_p, std_s))
 
     return torch.stack(losses).mean() if losses else torch.zeros((), device=x_pred_1ch.device)
+
+
+def _source_global_stats(cfg: Dict[str, Any]):
+    """建议4: 源域全局强度均值/对比度 (mean,std in [0,1]), 计算一次并缓存到 cfg。"""
+    key = "_stat_prior_cache"
+    if key not in cfg:
+        from source_style_stats import get_source_stats
+        m, s = get_source_stats(str(cfg["source_csv"]), image_size=int(cfg["image_size"]))
+        cfg[key] = (float(m), float(s))
+    return cfg[key]
+
+
+def _stat_prior_loss(x_pred_1ch: torch.Tensor, src_mean: float, src_std: float) -> torch.Tensor:
+    """约束生成图的逐样本强度均值/对比度贴近源域全局统计(域级条件先验, 无配对, 防过拟合)。
+    x_pred_1ch 在 [-1,1] -> 转 [0,1] 后与 [0,1] 源统计比较。"""
+    x01 = (x_pred_1ch.clamp(-1.0, 1.0) + 1.0) * 0.5
+    mu = x01.mean(dim=tuple(range(1, x01.ndim)))
+    sd = x01.std(dim=tuple(range(1, x01.ndim)), unbiased=False)
+    return (mu - float(src_mean)).abs().mean() + (sd - float(src_std)).abs().mean()
 
 
 def _resolve_effective_lambdas(cfg: Dict[str, Any]) -> Dict[str, float]:
@@ -558,6 +580,12 @@ def main() -> None:
             else:
                 x_a_hat = x_a_hat_bridge
 
+            # 建议4: 源域全局强度统计条件先验(域级损失约束, 独立消融开关)
+            loss_stat_prior = torch.zeros((), device=device)
+            if float(cfg.get("lambda_stat_prior", 0.0)) > 0.0:
+                _sm, _ss = _source_global_stats(cfg)
+                loss_stat_prior = _stat_prior_loss(x_a_hat, _sm, _ss)
+
             loss_feat_src = (
                 _feature_instance_l1(feat_extractor, x_a_hat, x_a_img)
                 if (cfg["lambda_feat_src"] > 0.0 and feat_extractor is not None)
@@ -630,6 +658,7 @@ def main() -> None:
                 + float(cfg.get("lambda_source_recon", 0.0)) * loss_source_recon
                 + float(cfg.get("lambda_delta_reg", 0.0)) * loss_delta_reg
                 + float(cfg.get("lambda_supcon", 0.0)) * loss_supcon
+                + float(cfg.get("lambda_stat_prior", 0.0)) * loss_stat_prior
             )
 
             optimizer.zero_grad(set_to_none=True)

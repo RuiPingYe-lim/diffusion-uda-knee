@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse, os, random
 import numpy as np, pandas as pd, torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.transforms as T
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
@@ -82,7 +83,7 @@ class CrossAttnFusionClassifier(nn.Module):
         原图注意力权重, 绝不会把垃圾特征注入输出。
     """
     def __init__(self, num_classes=2, pretrained=True, dim=256, heads=4, backbone="resnet50",
-                 mode="orig_kv"):
+                 mode="orig_kv", proj_dim=128):
         super().__init__()
         if mode not in ("orig_query", "orig_kv"):
             raise ValueError(f"mode must be orig_query|orig_kv, got {mode}")
@@ -101,33 +102,61 @@ class CrossAttnFusionClassifier(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.head = nn.Sequential(nn.Linear(dim, dim), nn.ReLU(inplace=True),
                                   nn.Dropout(0.3), nn.Linear(dim, num_classes))
+        # 建议⑤: 监督对比学习的投影头(仅在 supcon_weight>0 时用于对比损失)
+        self.proj_head = nn.Sequential(nn.Linear(dim, dim), nn.ReLU(inplace=True),
+                                       nn.Linear(dim, proj_dim))
 
     def _tokens(self, x):                       # x: [B,3,H,W] -> [B, h*w, dim]
         f = self.proj(self.backbone(x))
         return f.flatten(2).transpose(1, 2)
 
-    def forward(self, before, others):
-        # before: [B,3,H,W] 原图; others: [B,K,3,H,W] 翻译图/采样图
+    def _rep(self, before, others):
+        """融合后的 [B, dim] 表征(分类头与对比投影头共用)。"""
         B, K = others.shape[0], others.shape[1]
         before_tok = self._tokens(before)                             # [B, N, dim]
         oth_tok = self._tokens(others.reshape(B * K, *others.shape[2:]))  # [B*K, N, dim]
         N = oth_tok.shape[1]
-
         if self.mode == "orig_query":
             q = before_tok                                            # 原图 Query
             kv = oth_tok.reshape(B, K * N, self.dim)                  # 翻译图 K/V
             fused, _ = self.attn(q, kv, kv)
-            fused = self.norm(q + fused)
-            return self.head(fused.mean(dim=1))
-
+            return self.norm(q + fused).mean(dim=1)                   # [B, dim]
         # mode == "orig_kv" (导师): 翻译图 Query, 原图 K/V, 原图锚定残差
         kv = before_tok.repeat_interleave(K, dim=0)                   # [B*K, N, dim] 原图作 K/V
         q = oth_tok                                                   # [B*K, N, dim] 翻译图作 Query
         fused, _ = self.attn(q, kv, kv)                               # 值(V)全部来自原图
         fused = fused.reshape(B, K, N, self.dim).mean(dim=(1, 2))     # [B, dim] 池化 K 视图与 token
         anchor = before_tok.mean(dim=1)                              # [B, dim] 原图全局特征(主导锚)
-        out = self.norm(anchor + fused)                              # 原图主导, 翻译图仅调制
-        return self.head(out)
+        return self.norm(anchor + fused)                             # [B, dim] 原图主导, 翻译图仅调制
+
+    def forward(self, before, others, return_emb=False):
+        rep = self._rep(before, others)
+        logits = self.head(rep)
+        if return_emb:
+            return logits, F.normalize(self.proj_head(rep), dim=1)   # 归一化对比嵌入
+        return logits
+
+
+# ---------------- 建议⑤: 监督对比损失 (Khosla et al., SupCon) ----------------
+def sup_con_loss(emb, labels, temp=0.07):
+    """emb: [B, d] 已 L2 归一化; labels: [B]. 同类相吸、异类相斥。
+    只对 batch 内存在同类正样本的锚点求损失; 无正样本时返回 0(可反传)。"""
+    device = emb.device
+    B = emb.shape[0]
+    if B < 2:
+        return emb.sum() * 0.0
+    sim = (emb @ emb.t()) / float(temp)                      # [B,B]
+    self_mask = torch.eye(B, dtype=torch.bool, device=device)
+    labels = labels.contiguous().view(-1, 1)
+    pos_mask = (labels == labels.t()) & (~self_mask)         # 同类且非自身
+    sim = sim.masked_fill(self_mask, float("-inf"))          # 排除自身
+    log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)
+    pos_count = pos_mask.sum(1)
+    valid = pos_count > 0
+    if not valid.any():
+        return emb.sum() * 0.0
+    mean_log_prob_pos = (log_prob.masked_fill(~pos_mask, 0.0).sum(1)[valid]) / pos_count[valid]
+    return -(mean_log_prob_pos).mean()
 
 
 # ---------------- 训练/评估 ----------------
@@ -182,14 +211,19 @@ def main():
     ap.add_argument("--backbone", default="resnet50", choices=["resnet50", "resnet18"])
     ap.add_argument("--fusion_mode", default="orig_kv", choices=["orig_kv", "orig_query"],
                     help="orig_kv(导师建议,默认): 原图 K/V, 翻译图 Query; orig_query: 旧版反向")
+    # 建议⑤ 消融开关: 0 = 纯 CE(baseline); >0 = CE + λ·SupCon
+    ap.add_argument("--supcon_weight", type=float, default=0.0, help="监督对比损失权重(0=关,消融基线)")
+    ap.add_argument("--supcon_temp", type=float, default=0.07)
+    ap.add_argument("--proj_dim", type=int, default=128)
     ap.add_argument("--self_check", action="store_true", help="仅跑一次随机前向验证形状后退出")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     torch.manual_seed(a.seed); np.random.seed(a.seed); random.seed(a.seed)
     others = a.other_cols.split(",")
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = CrossAttnFusionClassifier(backbone=a.backbone, mode=a.fusion_mode).to(dev)
-    print(f"[fusion] mode={a.fusion_mode}  (K={len(others)} 翻译/采样图 + before 原图)")
+    model = CrossAttnFusionClassifier(backbone=a.backbone, mode=a.fusion_mode, proj_dim=a.proj_dim).to(dev)
+    print(f"[fusion] mode={a.fusion_mode}  supcon_weight={a.supcon_weight}  "
+          f"(K={len(others)} 翻译/采样图 + before 原图)")
 
     if a.self_check:
         model.eval()
@@ -218,17 +252,34 @@ def main():
                     batch_size=a.batch_size, num_workers=4)
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
     crit = nn.CrossEntropyLoss()
+    use_supcon = float(a.supcon_weight) > 0.0
     best = -1
     for ep in range(1, a.epochs + 1):
         model.train()
+        ce_sum = sc_sum = nb = 0.0
         for before, oth, y, _ in tr:
+            before, oth, y = before.to(dev), oth.to(dev), y.to(dev)
             opt.zero_grad()
-            loss = crit(model(before.to(dev), oth.to(dev)), y.to(dev))
-            loss.backward(); opt.step()
+            if use_supcon:
+                logits, emb = model(before, oth, return_emb=True)
+                ce = crit(logits, y)
+                sc = sup_con_loss(emb, y, temp=a.supcon_temp)
+                loss = ce + float(a.supcon_weight) * sc
+                ce_sum += float(ce.item()); sc_sum += float(sc.item())
+            else:
+                loss = crit(model(before, oth), y)
+                ce_sum += float(loss.item())
+            loss.backward(); opt.step(); nb += 1
         v = evaluate(model, va, dev)
-        print(f"epoch {ep} val_auc={v:.4f}")
+        msg = f"epoch {ep} val_auc={v:.4f} ce={ce_sum/max(nb,1):.4f}"
+        if use_supcon:
+            msg += f" supcon={sc_sum/max(nb,1):.4f}"
+        print(msg)
         if v > best:
-            best = v; torch.save({"model": model.state_dict(), "val_auc": v}, os.path.join(a.out_dir, "best.pt"))
+            best = v
+            torch.save({"model": model.state_dict(), "val_auc": v,
+                        "fusion_mode": a.fusion_mode, "supcon_weight": a.supcon_weight},
+                       os.path.join(a.out_dir, "best.pt"))
     print("best val AUC =", best)
 
 
