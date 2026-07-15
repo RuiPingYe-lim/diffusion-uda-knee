@@ -83,12 +83,19 @@ class CrossAttnFusionClassifier(nn.Module):
         原图注意力权重, 绝不会把垃圾特征注入输出。
     """
     def __init__(self, num_classes=2, pretrained=True, dim=256, heads=4, backbone="resnet50",
-                 mode="orig_kv", proj_dim=128):
+                 mode="orig_kv", proj_dim=128, stat_prior=False, src_mean=0.0, src_std=1.0):
         super().__init__()
         if mode not in ("orig_query", "orig_kv"):
             raise ValueError(f"mode must be orig_query|orig_kv, got {mode}")
         self.mode = mode
         self.dim = dim
+        # 建议④: 源域全局强度统计作为条件先验(特征向量注入). 关时=基线(FiLM 恒等)
+        self.stat_prior = bool(stat_prior)
+        self.register_buffer("src_stats", torch.tensor([float(src_mean), float(src_std)]))
+        if self.stat_prior:
+            # 每样本 6 维统计向量 [before_mean,before_std,fake_mean,fake_std,src_mean,src_std] -> FiLM(γ,β)
+            self.film = nn.Sequential(nn.Linear(6, dim), nn.ReLU(inplace=True), nn.Linear(dim, 2 * dim))
+            nn.init.zeros_(self.film[-1].weight); nn.init.zeros_(self.film[-1].bias)  # 初始=恒等
         if backbone == "resnet50":
             w = models.ResNet50_Weights.IMAGENET1K_V1 if pretrained else None
             base = models.resnet50(weights=w); feat_dim = 2048
@@ -110,6 +117,18 @@ class CrossAttnFusionClassifier(nn.Module):
         f = self.proj(self.backbone(x))
         return f.flatten(2).transpose(1, 2)
 
+    def _apply_stat_prior(self, rep, before, others):
+        """建议④: 用源域统计条件先验 FiLM 调制融合表征。
+        统计在 [0,1] 空间算(输入为 [-1,1]); FiLM 末层零初始 -> 开关初始等价基线。"""
+        b01 = (before + 1.0) * 0.5
+        o01 = (others + 1.0) * 0.5
+        bm = b01.mean(dim=(1, 2, 3)); bs = b01.std(dim=(1, 2, 3), unbiased=False)
+        fm = o01.mean(dim=(1, 2, 3, 4)); fs = o01.std(dim=(1, 2, 3, 4), unbiased=False)
+        sm = self.src_stats[0].expand_as(bm); ss = self.src_stats[1].expand_as(bm)
+        cond = torch.stack([bm, bs, fm, fs, sm, ss], dim=1)          # [B, 6]
+        gamma, beta = self.film(cond).chunk(2, dim=1)               # [B, dim] each
+        return rep * (1.0 + gamma) + beta
+
     def _rep(self, before, others):
         """融合后的 [B, dim] 表征(分类头与对比投影头共用)。"""
         B, K = others.shape[0], others.shape[1]
@@ -120,14 +139,18 @@ class CrossAttnFusionClassifier(nn.Module):
             q = before_tok                                            # 原图 Query
             kv = oth_tok.reshape(B, K * N, self.dim)                  # 翻译图 K/V
             fused, _ = self.attn(q, kv, kv)
-            return self.norm(q + fused).mean(dim=1)                   # [B, dim]
-        # mode == "orig_kv" (导师): 翻译图 Query, 原图 K/V, 原图锚定残差
-        kv = before_tok.repeat_interleave(K, dim=0)                   # [B*K, N, dim] 原图作 K/V
-        q = oth_tok                                                   # [B*K, N, dim] 翻译图作 Query
-        fused, _ = self.attn(q, kv, kv)                               # 值(V)全部来自原图
-        fused = fused.reshape(B, K, N, self.dim).mean(dim=(1, 2))     # [B, dim] 池化 K 视图与 token
-        anchor = before_tok.mean(dim=1)                              # [B, dim] 原图全局特征(主导锚)
-        return self.norm(anchor + fused)                             # [B, dim] 原图主导, 翻译图仅调制
+            rep = self.norm(q + fused).mean(dim=1)                    # [B, dim]
+        else:
+            # mode == "orig_kv" (导师): 翻译图 Query, 原图 K/V, 原图锚定残差
+            kv = before_tok.repeat_interleave(K, dim=0)               # [B*K, N, dim] 原图作 K/V
+            q = oth_tok                                               # [B*K, N, dim] 翻译图作 Query
+            fused, _ = self.attn(q, kv, kv)                           # 值(V)全部来自原图
+            fused = fused.reshape(B, K, N, self.dim).mean(dim=(1, 2)) # [B, dim] 池化 K 视图与 token
+            anchor = before_tok.mean(dim=1)                          # [B, dim] 原图全局特征(主导锚)
+            rep = self.norm(anchor + fused)                          # [B, dim] 原图主导, 翻译图仅调制
+        if self.stat_prior:                                          # 建议④ 条件先验注入
+            rep = self._apply_stat_prior(rep, before, others)
+        return rep
 
     def forward(self, before, others, return_emb=False):
         rep = self._rep(before, others)
@@ -194,6 +217,19 @@ def evaluate_volume(model, loader, dev):
     return slice_auc, auc(gm.y.values, gm.p.values), auc(gx.y.values, gx.p.values), auc(gt.y.values, gt.p.values)
 
 
+def _compute_before_stats(csv, col, resize, n=300):
+    """建议④: 源域(训练 before 列)全局强度均值/对比度 in [0,1]。"""
+    df = pd.read_csv(csv)
+    tf = T.Compose([T.ToTensor(), T.Resize((resize, resize), antialias=True)])
+    idx = list(range(len(df))); random.Random(0).shuffle(idx); idx = idx[:min(n, len(df))]
+    s = ss = cnt = 0.0
+    for i in idx:
+        g = tf(Image.open(df.iloc[i][col]).convert("L")).clamp(0, 1)
+        s += float(g.sum()); ss += float((g * g).sum()); cnt += g.numel()
+    m = s / cnt
+    return float(m), float(max(ss / cnt - m * m, 1e-8) ** 0.5)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["train", "eval"], required=True)
@@ -215,37 +251,49 @@ def main():
     ap.add_argument("--supcon_weight", type=float, default=0.0, help="监督对比损失权重(0=关,消融基线)")
     ap.add_argument("--supcon_temp", type=float, default=0.07)
     ap.add_argument("--proj_dim", type=int, default=128)
+    # 建议④ 消融开关: 源域统计条件先验(特征向量 FiLM 注入); 关=基线
+    ap.add_argument("--stat_prior", action="store_true", help="建议④: 源域统计作条件先验(FiLM 注入)")
     ap.add_argument("--self_check", action="store_true", help="仅跑一次随机前向验证形状后退出")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     torch.manual_seed(a.seed); np.random.seed(a.seed); random.seed(a.seed)
     others = a.other_cols.split(",")
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = CrossAttnFusionClassifier(backbone=a.backbone, mode=a.fusion_mode, proj_dim=a.proj_dim).to(dev)
-    print(f"[fusion] mode={a.fusion_mode}  supcon_weight={a.supcon_weight}  "
-          f"(K={len(others)} 翻译/采样图 + before 原图)")
+
+    def build(stat_prior, sm, ss):
+        return CrossAttnFusionClassifier(backbone=a.backbone, mode=a.fusion_mode, proj_dim=a.proj_dim,
+                                         stat_prior=stat_prior, src_mean=sm, src_std=ss).to(dev)
 
     if a.self_check:
+        model = build(a.stat_prior, 0.4, 0.2)
         model.eval()
         with torch.no_grad():
             b = torch.randn(2, 3, a.resize, a.resize, device=dev)
             o = torch.randn(2, len(others), 3, a.resize, a.resize, device=dev)
             out = model(b, o)
         assert out.shape == (2, 2), out.shape
-        print(f"[self_check] OK  forward out={tuple(out.shape)}  mode={a.fusion_mode}")
+        print(f"[self_check] OK  out={tuple(out.shape)}  mode={a.fusion_mode}  stat_prior={a.stat_prior}")
         return
 
     if a.mode == "eval":
         ck = torch.load(a.weights, map_location=dev, weights_only=False)
+        model = build(bool(ck.get("stat_prior", False)), float(ck.get("src_mean", 0.0)), float(ck.get("src_std", 1.0)))
         model.load_state_dict(ck["model"])
         dl = DataLoader(MultiImageDataset(a.test_csv, a.before_col, others, a.label_col, a.resize),
                         batch_size=a.batch_size, num_workers=4)
         sa, vm, vx, vt = evaluate_volume(model, dl, dev)
-        print("fusion eval  slice_AUC=%.3f  (K=%d 风格图 + before)" % (sa, len(others)))
+        print("fusion eval  slice_AUC=%.3f  (K=%d 风格图 + before, stat_prior=%s)" % (sa, len(others), model.stat_prior))
         print("    volume_AUC:  mean=%.3f  max=%.3f  top5=%.3f" % (vm, vx, vt))
         return
 
     os.makedirs(a.out_dir, exist_ok=True)
+    src_mean, src_std = 0.0, 1.0
+    if a.stat_prior:
+        src_mean, src_std = _compute_before_stats(a.train_csv, a.before_col, a.resize)
+        print(f"[stat_prior④] source before-image stats: mean={src_mean:.4f} std={src_std:.4f}")
+    model = build(a.stat_prior, src_mean, src_std)
+    print(f"[fusion] mode={a.fusion_mode}  supcon_weight={a.supcon_weight}  stat_prior={a.stat_prior}  "
+          f"(K={len(others)} 翻译/采样图 + before 原图)")
     tr = DataLoader(MultiImageDataset(a.train_csv, a.before_col, others, a.label_col, a.resize, True),
                     batch_size=a.batch_size, shuffle=True, num_workers=4)
     va = DataLoader(MultiImageDataset(a.val_csv, a.before_col, others, a.label_col, a.resize),
@@ -278,7 +326,8 @@ def main():
         if v > best:
             best = v
             torch.save({"model": model.state_dict(), "val_auc": v,
-                        "fusion_mode": a.fusion_mode, "supcon_weight": a.supcon_weight},
+                        "fusion_mode": a.fusion_mode, "supcon_weight": a.supcon_weight,
+                        "stat_prior": a.stat_prior, "src_mean": src_mean, "src_std": src_std},
                        os.path.join(a.out_dir, "best.pt"))
     print("best val AUC =", best)
 
