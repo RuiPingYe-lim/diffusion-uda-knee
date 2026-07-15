@@ -1,7 +1,17 @@
 # 交接文档 / Handoff for review
 
 > 目的:把「已实现的代码」「跑出的结果」「未决问题」一次说清,便于第三方(GPT)复核代码与实验逻辑。
-> 仓库:https://github.com/RuiPingYe-lim/diffusion-uda-knee  (main 分支,截至 commit `926f181`,已全部推送)
+> 仓库:https://github.com/RuiPingYe-lim/diffusion-uda-knee  (main 分支)
+
+## ⚠️ 复核后的重大更正(2026-07-16,采纳外部 review)
+
+初版 HANDOFF 有两处结论**站不住,已作废**:
+1. **BBDM 结果不是严格 UDA**:`label_random` 配对在**训练期读取目标标签**挑同类源端点;采样不用标签**不能**抵消训练期泄漏。BBDM 结果应称「**目标标签辅助的伪配对诊断**」。且「同一目标图每 epoch 配不同源端点」使 MSE 趋向学「同类源图平均」,这更好地解释了模糊/内容坍塌。
+2. **融合实验不是 matched comparison**:融合用普通 `torchvision resnet50`,direct 用 `custom_resnet50_space`,训练配方也不同;且训练喂 `G_t→s(源图)`(OOD)、测试喂 `G_t→s(目标图)`。**因此不能下结论「天花板=direct」或「翻译不含增量信息」。**
+
+**据此作废/弱化的措辞**:「外观差被抹掉」「翻译-融合栈天花板=direct」「翻译不含增量信息」「所有结果约 ±0.05 bootstrap 噪声」;「UNSB 单调下降」→「点估计总体下降」。
+**事实更正**:BrEaST/BUSI 是**普通 2D 超声,不是 mean-projection**(仅膝关节是 mean-projection)。
+下面正文保留原始记录,但请以本节更正为准;P0 代码修复进行中(见 §8)。
 
 ---
 
@@ -10,9 +20,9 @@
 诊断分类的**无监督域适应(UDA)**:用「源域标注数据」训练的分类器,在「无标注目标域」上工作。
 思路:用**生成式翻译**把目标域图像翻译成源域风格 → 让源域分类器直接可用。
 
-两套数据(均为 mean-projection / 单图-单病例,二分类):
-- **膝关节 MRI**:MRNet(源) ↔ KneeMRI(目标)。方向 m2k = MRNet→KneeMRI。
-- **乳腺超声**:BUSI(源) ↔ BrEaST(目标)。
+两套数据(单图-单病例,二分类):
+- **膝关节 MRI**:MRNet(源) ↔ KneeMRI(目标)。方向 m2k = MRNet→KneeMRI。**mean-projection**(体数据沿切片平均→单图)。
+- **乳腺超声**:BUSI(源) ↔ BrEaST(目标)。**普通 2D 超声原图**(非 mean-projection)。
 
 核心疑问:**这个「翻译」到底能不能提升目标域分类 AUC?**
 
@@ -158,3 +168,29 @@ python src/bbdm_strict/fusion_classifier.py --mode eval --weights run/best.pt --
 # 多种子 2×2(断点续跑)
 bash scripts/run_multiseed_2x2.sh
 ```
+
+---
+
+## 8. P0 修复清单(采纳 review;进行中)
+
+**改协议 / 命名**
+- [ ] `label_random` → `label_oracle_random`;新增 `--protocol uda` 严格拒绝真实目标标签;伪标签需记 `label_provenance=pseudo` + checkpoint/manifest hash。
+- [ ] BBDM 结果统一改称「目标标签辅助伪配对诊断」。
+- [ ] `eval_meanproj_oracle.py` → `eval_meanproj_moment_intervention.py`;修其中「用像素 std 标准化域间均值差」→ 用逐病例均值的 pooled between-case SD;futility 判据改为「CI 上界 < 预设 MCID」。
+
+**融合改成严格匹配 + 安全残差适配器(P0 核心)**
+- [ ] 三模式 `before_only` / `repeat_before`(K 张原图复制,控参数量/算力) / `true_fakes`,共享 source checkpoint、公共层初始化、DataLoader 顺序。
+- [ ] 残差适配器:`logits = frozen_src(before) + tanh(alpha)*delta(before,others)`,`alpha=0` 初始化、冻结 source backbone+BN → 初始逐病例精确等于 direct。
+- [ ] FiLM 始终实例化、仅用 gate 开关(修 RNG 消耗导致的非配对);每 seed 从同一公共初始化 checkpoint 起。
+- [ ] checkpoint 保存并在 eval 强制恢复:fusion_mode / backbone/dim/heads/proj_dim / resize+预处理版本 / other_cols+顺序 / seed/epoch/commit / hash(当前 eval 忽略 fusion_mode)。
+- [ ] 正确配对分布:训练 before=`G_s→t(x_s)`、other=`x_s`;测试 before=`x_t`、other=`G_t→s(x_t)`。**需训练源→目标反方向生成器**;不训则不继续监督融合。
+
+**数据 / 脚本**
+- [ ] `build_fusion_csvs_*.py`:精确唯一键连接(修 `12`→`120` 前缀误配);重复/缺失默认失败。
+- [ ] `run_multiseed_2x2.sh`:配置哈希 + `DONE` 标记 + 原子 JSON + 独立日志 + `set -euo pipefail`;保存逐病例概率。
+
+**评估 / 硬化(P1)**
+- [ ] `eval_unsb_translation.py`:direct 不复现→非零退出;禁静默丢病例;每 fake 相对 direct 的配对 CI。
+- [ ] `eval_bbdm_translation.py`:强制 case_id、病例内标签一致、direct anchor。
+
+**唯一待跑实验(修完后)**:`before_only vs repeat_before vs true_fakes`(stat_prior=False, supcon=0),3 种子筛选;`true_fakes` 相对两控制平均 ≥+0.01 才扩 5 种子 + ④⑤;保存逐病例、做 seed/case 两层不确定性。若仍不过 → 关闭生成-融合主线,转 matched NMF/特征对齐。
