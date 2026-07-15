@@ -71,8 +71,23 @@ class MultiImageDataset(Dataset):
 
 # ---------------- 模型 ----------------
 class CrossAttnFusionClassifier(nn.Module):
-    def __init__(self, num_classes=2, pretrained=True, dim=256, heads=4, backbone="resnet50"):
+    """交叉注意力融合。两种注意力方向:
+
+    mode="orig_query" (旧): 原图=Query, 翻译图=Key/Value。输出取值于翻译图,
+        原图只决定注意哪里 —— 翻译图若毁内容会直接污染输出。
+
+    mode="orig_kv" (导师建议, 默认): 翻译图=Query, 原图=Key/Value。注意力输出的
+        值(V)全部来自原图, 翻译图只重新加权原图特征; 再叠加一条原图全局特征的
+        锚定残差, 保证原图主导。对"翻译图毁内容"的失败模式鲁棒: 坏翻译最多重排
+        原图注意力权重, 绝不会把垃圾特征注入输出。
+    """
+    def __init__(self, num_classes=2, pretrained=True, dim=256, heads=4, backbone="resnet50",
+                 mode="orig_kv"):
         super().__init__()
+        if mode not in ("orig_query", "orig_kv"):
+            raise ValueError(f"mode must be orig_query|orig_kv, got {mode}")
+        self.mode = mode
+        self.dim = dim
         if backbone == "resnet50":
             w = models.ResNet50_Weights.IMAGENET1K_V1 if pretrained else None
             base = models.resnet50(weights=w); feat_dim = 2048
@@ -92,15 +107,27 @@ class CrossAttnFusionClassifier(nn.Module):
         return f.flatten(2).transpose(1, 2)
 
     def forward(self, before, others):
-        # before: [B,3,H,W]; others: [B,K,3,H,W]
+        # before: [B,3,H,W] 原图; others: [B,K,3,H,W] 翻译图/采样图
         B, K = others.shape[0], others.shape[1]
-        q = self._tokens(before)                                  # [B, N, dim]  原图 query
-        oth = self._tokens(others.reshape(B * K, *others.shape[2:]))  # [B*K, N, dim]
-        N = oth.shape[1]
-        kv = oth.reshape(B, K * N, oth.shape[2])                  # [B, K*N, dim] 所有风格图的 token 拼一起
-        fused, _ = self.attn(q, kv, kv)                           # before 去 query 全部风格图
-        fused = self.norm(q + fused)
-        return self.head(fused.mean(dim=1))
+        before_tok = self._tokens(before)                             # [B, N, dim]
+        oth_tok = self._tokens(others.reshape(B * K, *others.shape[2:]))  # [B*K, N, dim]
+        N = oth_tok.shape[1]
+
+        if self.mode == "orig_query":
+            q = before_tok                                            # 原图 Query
+            kv = oth_tok.reshape(B, K * N, self.dim)                  # 翻译图 K/V
+            fused, _ = self.attn(q, kv, kv)
+            fused = self.norm(q + fused)
+            return self.head(fused.mean(dim=1))
+
+        # mode == "orig_kv" (导师): 翻译图 Query, 原图 K/V, 原图锚定残差
+        kv = before_tok.repeat_interleave(K, dim=0)                   # [B*K, N, dim] 原图作 K/V
+        q = oth_tok                                                   # [B*K, N, dim] 翻译图作 Query
+        fused, _ = self.attn(q, kv, kv)                               # 值(V)全部来自原图
+        fused = fused.reshape(B, K, N, self.dim).mean(dim=(1, 2))     # [B, dim] 池化 K 视图与 token
+        anchor = before_tok.mean(dim=1)                              # [B, dim] 原图全局特征(主导锚)
+        out = self.norm(anchor + fused)                              # 原图主导, 翻译图仅调制
+        return self.head(out)
 
 
 # ---------------- 训练/评估 ----------------
@@ -153,12 +180,26 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--resize", type=int, default=224)
     ap.add_argument("--backbone", default="resnet50", choices=["resnet50", "resnet18"])
+    ap.add_argument("--fusion_mode", default="orig_kv", choices=["orig_kv", "orig_query"],
+                    help="orig_kv(导师建议,默认): 原图 K/V, 翻译图 Query; orig_query: 旧版反向")
+    ap.add_argument("--self_check", action="store_true", help="仅跑一次随机前向验证形状后退出")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     torch.manual_seed(a.seed); np.random.seed(a.seed); random.seed(a.seed)
     others = a.other_cols.split(",")
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = CrossAttnFusionClassifier(backbone=a.backbone).to(dev)
+    model = CrossAttnFusionClassifier(backbone=a.backbone, mode=a.fusion_mode).to(dev)
+    print(f"[fusion] mode={a.fusion_mode}  (K={len(others)} 翻译/采样图 + before 原图)")
+
+    if a.self_check:
+        model.eval()
+        with torch.no_grad():
+            b = torch.randn(2, 3, a.resize, a.resize, device=dev)
+            o = torch.randn(2, len(others), 3, a.resize, a.resize, device=dev)
+            out = model(b, o)
+        assert out.shape == (2, 2), out.shape
+        print(f"[self_check] OK  forward out={tuple(out.shape)}  mode={a.fusion_mode}")
+        return
 
     if a.mode == "eval":
         ck = torch.load(a.weights, map_location=dev, weights_only=False)
