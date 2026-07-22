@@ -179,11 +179,12 @@ def main():
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     others = [c.strip() for c in a.other_cols.split(",") if c.strip()]
 
-    # code-level guard: repeat_before must NOT be fed fake columns; true_fakes needs >=2 distinct
-    if a.control == "repeat_before" and any("fake" in c.lower() for c in others):
-        raise ValueError("--control repeat_before must NOT pass fake_* in --other_cols (copies are built in code)")
-    if a.control == "true_fakes" and len(set(others)) < 2:
-        raise ValueError("--control true_fakes needs >=2 distinct fake columns")
+    # code-level guard (TRAIN only; eval restores control from the checkpoint config):
+    if a.mode == "train":
+        if a.control == "repeat_before" and any("fake" in c.lower() for c in others):
+            raise ValueError("--control repeat_before must NOT pass fake_* in --other_cols (copies are built in code)")
+        if a.control == "true_fakes" and len(set(others)) < 2:
+            raise ValueError("--control true_fakes needs >=2 distinct fake columns")
 
     if a.self_check:
         for ctrl in CONTROLS:

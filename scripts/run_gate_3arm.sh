@@ -25,7 +25,8 @@ run() {  # control other_cols_train other_cols_eval seed  (train_csv/val only fo
       --train_csv "$C/fusion_train_busi.csv" --val_csv "$C/fusion_val_busi.csv" \
       --other_cols "$octr" --out_dir "$d" --epochs 30 --batch_size 16 --lr 1e-4 --seed "$seed"
   fi
-  $PY fusion_gate.py --mode eval --weights "$d/best.pt" --test_csv "$EVAL" \
+  rm -f "$d/percase.csv"   # never let a stale eval survive a failed re-run
+  $PY fusion_gate.py --mode eval --control "$ctrl" --weights "$d/best.pt" --test_csv "$EVAL" \
     --other_cols "$oev" --out_csv "$d/percase.csv"
 }
 
