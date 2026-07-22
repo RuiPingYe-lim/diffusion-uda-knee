@@ -97,6 +97,17 @@ class ShuffledOthersDataset(torch.utils.data.Dataset):
         return before, others, y, case
 
 
+def trainable_state(model):
+    """State dict WITHOUT the frozen source classifier.
+
+    frozen_src is byte-identical in every run (it is loaded from cfg["source_ckpt"],
+    whose sha256 is recorded), so storing it per run wastes 111 MB a time -- enough
+    to fill a 50 GB disk during a 60-run cross-validation. Eval rebuilds it from
+    the source checkpoint and loads this with strict=False.
+    """
+    return {k: v for k, v in model.state_dict().items() if not k.startswith("frozen_src.")}
+
+
 def sha256_file(p):
     if not p or not os.path.isfile(p):
         return None
@@ -274,7 +285,14 @@ def main():
                            dim=cfg["dim"], heads=cfg["heads"], proj_dim=cfg["proj_dim"],
                            stat_prior=cfg["stat_prior"], src_mean=cfg["src_mean"], src_std=cfg["src_std"],
                            fusion_mode=cfg.get("fusion_mode", "orig_kv")).to(dev)
-        model.load_state_dict(ck["model"])
+        # checkpoints store ONLY the trainable part; frozen_src was already loaded
+        # from cfg["source_ckpt"] in __init__ (and its hash is recorded), so a
+        # slim checkpoint must not re-supply it.
+        res = model.load_state_dict(ck["model"], strict=False)
+        unexpected = list(res.unexpected_keys)
+        missing = [k for k in res.missing_keys if not k.startswith("frozen_src.")]
+        if unexpected or missing:
+            raise RuntimeError(f"checkpoint mismatch: missing={missing[:5]} unexpected={unexpected[:5]}")
         ds = MultiImageDataset(a.test_csv, cfg["before_col"], ocols, a.label_col, cfg["resize"])
         if cfg.get("shuffle_others", False) and not a.shuffle_others:
             # footgun: an arm trained on broken pairing evaluated with true pairing is
@@ -313,7 +331,7 @@ def main():
                "proj_dim": a.proj_dim, "stat_prior": False, "src_mean": 0.0, "src_std": 1.0,
                "fusion_mode": a.fusion_mode, "shuffle_others": False, "shuffle_seed": -1,
                "before_col": a.before_col, "other_cols": a.other_cols, "resize": a.resize, "seed": a.seed}
-        torch.save({"model": model.state_dict(), "config": cfg, "epoch": 0, "val_auc": float("nan")},
+        torch.save({"model": trainable_state(model), "config": cfg, "epoch": 0, "val_auc": float("nan")},
                    os.path.join(a.out_dir, "best.pt"))
         print("[gate] control=direct: no training; frozen source saved as best.pt (evaluate with --mode eval)")
         return
@@ -368,7 +386,7 @@ def main():
         print(f"epoch {ep} val_case_auc={vauc:.4f}")
         if vauc > best:
             best = vauc
-            torch.save({"model": model.state_dict(), "val_auc": vauc, "epoch": ep, "config": cfg},
+            torch.save({"model": trainable_state(model), "val_auc": vauc, "epoch": ep, "config": cfg},
                        os.path.join(a.out_dir, "best.pt"))
     print(f"[gate] control={a.control} best val_case_auc={best:.4f}")
 

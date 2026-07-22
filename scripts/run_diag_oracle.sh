@@ -54,6 +54,11 @@ for M in $MODES; do
         --other_cols "$cols" --out_csv "$d/percase.csv"
       $PY fusion_gate.py --mode eval --weights "$d/best.pt" --test_csv "$F/f${k}_train.csv" \
         --other_cols "$cols" --out_csv "$d/percase_trainfit.csv" > /dev/null
+      # 60 folds x ~98 MB would fill the disk. The per-case CSVs already record
+      # checkpoint/source/generator/manifest sha256 and the full config is echoed
+      # in train.log, so the RESULT stays traceable; only the weights of these
+      # diagnostic folds are not retained. Headline runs (gate3arm*) keep theirs.
+      [ "${KEEP_CKPT:-0}" = "1" ] || rm -f "$d/best.pt"
     done
   done
   # coverage assert (review must-fix #3): the pooled out-of-fold set must be the
