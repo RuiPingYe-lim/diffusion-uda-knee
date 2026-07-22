@@ -1,12 +1,19 @@
-"""Build breast fusion CSVs from UNSB b2u translations.
+"""Build breast fusion CSVs with the CORRECT matched pairing (review P0 fix).
 
-FIXED (review P0): EXACT unique-key join (no glob prefix match -> no "12"/"120"
-collision); a missing translation or a duplicate case_id is a HARD ERROR, never
-a silent drop. Structure: before = raw image, others = its b2u output (source-
-styled) at bridge steps fake_1..fake_5.
-  train/val: source BUSI (before=busi raw, fakes=b2u(busi), label=busi)
-  eval     : target BrEaST diagnostic (before=breast raw, fakes=b2u(breast),
-             label=breast, case_id) -- LOCKED breast_test excluded.
+CORRECT UDA pairing (was WRONG before: train fed raw BUSI into G_t->s = OOD):
+  train/val (labeled = source BUSI):
+      before = G_s->t(x_s)          # u2b_rev output (target-styled source), fake_5
+      fake_1..5 = G_t->s(before)    # b2u cycle-back of that target-styled image
+      label = BUSI source label
+  eval (target BrEaST diagnostic):
+      before = x_t (raw BrEaST), fake_1..5 = G_t->s(x_t) = b2u(BrEaST)   [already correct]
+
+Prereq translation passes (run before this script):
+  1) UNSB test u2b_rev on BUSI (u2b_rev/testA) -> results_u2b_rev/.../fake_5/<key>.png
+  2) build cycleback dataset (testA = those fake_5) + UNSB test b2u
+     -> results_cycleback/.../fake_1..5/<key>.png
+
+EXACT unique-key join; missing/duplicate -> HARD ERROR (no silent drops).
 """
 import os
 import pandas as pd
@@ -15,44 +22,54 @@ C = "/root/autodl-tmp/breast/cache"
 UNSB = "/root/autodl-tmp/UNSB"
 FAKES = ["fake_1", "fake_2", "fake_3", "fake_4", "fake_5"]
 
+REV_DIR = f"{UNSB}/results_u2b_rev/u2b_rev_SB/test_latest/images"      # G_s->t(BUSI): befores
+CYC_DIR = f"{UNSB}/results_cycleback/b2u_SB/test_latest/images"        # G_t->s(before): others
+EVAL_DIR = f"{UNSB}/results/b2u_SB/test_latest/images"                 # G_t->s(BrEaST): eval others
 
-def exact_path(images_dir, arm, stem):
-    """EXACT match only: <images_dir>/<arm>/<stem>.png must exist (fail-loud)."""
+
+def exact(images_dir, arm, stem):
     p = os.path.join(images_dir, arm, f"{stem}.png")
     if not os.path.isfile(p):
         raise FileNotFoundError(f"missing translation: {p}")
     return p
 
 
-def build(rows, images_dir, key_to_stem, out_csv, with_case=False):
-    stems = [key_to_stem(m) for m in rows]
-    dup = {s for s in stems if stems.count(s) > 1}
-    if dup:
-        raise ValueError(f"duplicate keys in {out_csv}: {sorted(dup)[:8]}")
+def build_train(manifest_csv, split, out_csv):
+    """before = u2b_rev fake_5 (target-styled source); others = b2u cycle-back fake_1..5."""
+    man = pd.read_csv(manifest_csv)
+    rows = man[man["split"] == split]
+    keys = [str(k) for k in rows["key"]]
+    if len(set(keys)) != len(keys):
+        raise ValueError(f"duplicate keys in {split}")
     out = []
-    for m in rows:
-        stem = key_to_stem(m)
-        rec = {"before_png": m["image_path"], "label": int(m["label"])}
+    for _, r in rows.iterrows():
+        key = str(r["key"])
+        rec = {"before_png": exact(REV_DIR, "fake_5", key), "label": int(r["label"]), "key": key}
         for a in FAKES:
-            rec[a] = exact_path(images_dir, a, stem)   # raises if missing
-        if with_case:
-            rec["case_id"] = m["case_id"]
+            rec[a] = exact(CYC_DIR, a, key)
         out.append(rec)
-    df = pd.DataFrame(out)
-    df.to_csv(out_csv, index=False)
-    print(f"{out_csv}: {len(df)} rows (0 missing, 0 dup)")
+    pd.DataFrame(out).to_csv(out_csv, index=False)
+    print(f"{out_csv}: {len(out)} rows (correct pairing: before=G_s->t, others=cycle-back)")
 
 
-# eval: target BrEaST diagnostic (translations named by case_id)
-diag = pd.read_csv(f"{C}/breast_diag_cid.csv")
-build([{"image_path": r["image_path"], "label": int(r["label"]), "case_id": str(r["case_id"])}
-       for _, r in diag.iterrows()],
-      f"{UNSB}/results/b2u_SB/test_latest/images", lambda m: m["case_id"],
-      f"{C}/fusion_eval_breast_diag.csv", with_case=True)
+def build_eval(diag_csv, out_csv):
+    """before = raw BrEaST (target); others = b2u(BrEaST). Already the correct test pairing."""
+    diag = pd.read_csv(diag_csv)
+    if not diag["case_id"].is_unique:
+        raise ValueError("duplicate case_id in diagnostic set")
+    out = []
+    for _, r in diag.iterrows():
+        cid = str(r["case_id"])
+        rec = {"before_png": r["image_path"], "label": int(r["label"]), "case_id": cid}
+        for a in FAKES:
+            rec[a] = exact(EVAL_DIR, a, cid)
+        out.append(rec)
+    pd.DataFrame(out).to_csv(out_csv, index=False)
+    print(f"{out_csv}: {len(out)} rows (eval: before=raw target, others=b2u(target))")
 
-# train/val: source BUSI (translations named by key)
-man = pd.read_csv(f"{C}/b2u_srcapply_manifest.csv")
-for split, out in [("busi_train", "fusion_train_busi.csv"), ("busi_valid", "fusion_val_busi.csv")]:
-    rows = [{"image_path": r["image_path"], "label": int(r["label"]), "key": str(r["key"])}
-            for _, r in man[man["split"] == split].iterrows()]
-    build(rows, f"{UNSB}/results_srcapply/b2u_SB/test_latest/images", lambda m: m["key"], f"{C}/{out}")
+
+if __name__ == "__main__":
+    man = f"{C}/u2b_rev_srcapply_manifest.csv"    # key,split,image_path,label (from build_unsb_reverse_dataset)
+    build_train(man, "src_train", f"{C}/fusion_train_busi.csv")
+    build_train(man, "src_valid", f"{C}/fusion_val_busi.csv")
+    build_eval(f"{C}/breast_diag_cid.csv", f"{C}/fusion_eval_breast_diag.csv")
