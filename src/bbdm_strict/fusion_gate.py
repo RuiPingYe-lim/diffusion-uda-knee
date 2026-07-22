@@ -58,6 +58,45 @@ from fusion_classifier import CrossAttnFusionClassifier, MultiImageDataset, auc,
 CONTROLS = ("direct", "repeat_before", "true_fakes")
 
 
+class ShuffledOthersDataset(torch.utils.data.Dataset):
+    """`others` come from a DIFFERENT row (fixed derangement); `before`/label/case unchanged.
+
+    Diagnostic control for "does the adapter actually READ the other views?".
+    If AUC and the per-case residual are unchanged after breaking the
+    before<->others correspondence, the adapter is ignoring `others` and the
+    residual is a function of `before` alone (an ARCHITECTURE failure, not
+    evidence about the information content of the translations).
+    """
+
+    def __init__(self, base, seed=12345):
+        self.base = base
+        n = len(base)
+        if n < 2:
+            raise ValueError("shuffle_others needs >=2 rows")
+        perm = np.random.RandomState(seed).permutation(n)
+        for i in range(n):  # force a derangement: no row keeps its own others
+            if perm[i] == i:
+                j = (i + 1) % n
+                perm[i], perm[j] = perm[j], perm[i]
+        assert not (perm == np.arange(n)).any(), "derangement failed"
+        assert len(set(perm.tolist())) == n, "not a permutation"
+        self.perm = perm
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, i):
+        before, _, y, case = self.base[i]
+        # read ONLY the other row's `others` columns (not its `before`) -- half the
+        # image decodes of a second full base[] call, and identical in distribution:
+        # one shared flip decision across the K borrowed views, exactly as the base
+        # dataset does.
+        r = self.base.df.iloc[int(self.perm[i])]
+        do_flip = self.base.is_train and (random.random() < 0.5)
+        others = torch.stack([self.base._load(r[c], do_flip) for c in self.base.others])
+        return before, others, y, case
+
+
 def sha256_file(p):
     if not p or not os.path.isfile(p):
         return None
@@ -73,7 +112,8 @@ class FusionGate(nn.Module):
 
     def __init__(self, source_ckpt, control="true_fakes", backbone="custom_resnet50_space",
                  pretrained="imagenet", adapter_backbone="resnet50", dim=256, heads=4,
-                 proj_dim=128, stat_prior=False, src_mean=0.0, src_std=1.0, num_classes=2):
+                 proj_dim=128, stat_prior=False, src_mean=0.0, src_std=1.0, num_classes=2,
+                 fusion_mode="orig_kv"):
         super().__init__()
         if control not in CONTROLS:
             raise ValueError(f"control must be one of {CONTROLS}")
@@ -96,7 +136,7 @@ class FusionGate(nn.Module):
         if control != "direct":
             self.adapter = CrossAttnFusionClassifier(
                 num_classes=num_classes, pretrained=True, dim=dim, heads=heads,
-                backbone=adapter_backbone, mode="orig_kv", proj_dim=proj_dim,
+                backbone=adapter_backbone, mode=fusion_mode, proj_dim=proj_dim,
                 stat_prior=stat_prior, src_mean=src_mean, src_std=src_std)
             self.residual_head = nn.Linear(dim, 1)         # scalar margin correction
             nn.init.zeros_(self.residual_head.weight)      # ZERO-init -> init == direct, but grad != 0
@@ -163,6 +203,12 @@ def main():
     ap.add_argument("--dim", type=int, default=256)
     ap.add_argument("--heads", type=int, default=4)
     ap.add_argument("--proj_dim", type=int, default=128)
+    ap.add_argument("--fusion_mode", default="orig_kv", choices=["orig_kv", "orig_query"],
+                    help="orig_kv (advisor's suggestion): translated=Query, ORIGINAL=Key/Value -- the attention "
+                         "VALUES all come from the original, so `others` can only re-weight attention over the "
+                         "original's own tokens and can never inject content. orig_query: translated=Key/Value, "
+                         "so the translation CAN contribute values (needed to test whether translations carry "
+                         "usable information at all).")
     ap.add_argument("--stat_prior", action="store_true")
     ap.add_argument("--supcon_weight", type=float, default=0.0)
     ap.add_argument("--supcon_temp", type=float, default=0.07)
@@ -173,6 +219,11 @@ def main():
     ap.add_argument("--resize", type=int, default=224)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out_csv", type=Path, default=None, help="per-case predictions (defaults to out_dir/eval)")
+    ap.add_argument("--shuffle_others", action="store_true",
+                    help="DIAGNOSTIC: pair each `before` with ANOTHER row's `others` (fixed derangement). "
+                         "Valid only with --control true_fakes. Usable at eval on an existing checkpoint "
+                         "(lesion test) or at train+eval (matched no-pairing arm).")
+    ap.add_argument("--shuffle_seed", type=int, default=12345)
     ap.add_argument("--self_check", action="store_true")
     a = ap.parse_args()
     torch.manual_seed(a.seed); np.random.seed(a.seed); random.seed(a.seed)
@@ -185,6 +236,9 @@ def main():
             raise ValueError("--control repeat_before must NOT pass fake_* in --other_cols (copies are built in code)")
         if a.control == "true_fakes" and len(set(others)) < 2:
             raise ValueError("--control true_fakes needs >=2 distinct fake columns")
+        if a.shuffle_others and a.control != "true_fakes":
+            raise ValueError("--shuffle_others is only meaningful with --control true_fakes "
+                             f"(got {a.control}: `others` are rebuilt/unused, so shuffling is a no-op)")
 
     if a.self_check:
         for ctrl in CONTROLS:
@@ -194,7 +248,7 @@ def main():
                 p.requires_grad_(False)
             m.frozen_src.eval()
             if ctrl != "direct":
-                m.adapter = CrossAttnFusionClassifier(pretrained=False, mode="orig_kv", backbone=a.adapter_backbone)
+                m.adapter = CrossAttnFusionClassifier(pretrained=False, mode=a.fusion_mode, backbone=a.adapter_backbone)
                 m.residual_head = nn.Linear(256, 1); nn.init.zeros_(m.residual_head.weight); nn.init.zeros_(m.residual_head.bias)
             b = torch.randn(2, 3, a.resize, a.resize); o = torch.randn(2, 5, 3, a.resize, a.resize)
             fm = m(b, o)
@@ -218,12 +272,26 @@ def main():
         model = FusionGate(cfg["source_ckpt"], control=cfg["control"], backbone=cfg["backbone"],
                            pretrained=cfg["pretrained"], adapter_backbone=cfg["adapter_backbone"],
                            dim=cfg["dim"], heads=cfg["heads"], proj_dim=cfg["proj_dim"],
-                           stat_prior=cfg["stat_prior"], src_mean=cfg["src_mean"], src_std=cfg["src_std"]).to(dev)
+                           stat_prior=cfg["stat_prior"], src_mean=cfg["src_mean"], src_std=cfg["src_std"],
+                           fusion_mode=cfg.get("fusion_mode", "orig_kv")).to(dev)
         model.load_state_dict(ck["model"])
-        dl = DataLoader(MultiImageDataset(a.test_csv, cfg["before_col"], ocols, a.label_col, cfg["resize"]),
-                        batch_size=a.batch_size, num_workers=4)
+        ds = MultiImageDataset(a.test_csv, cfg["before_col"], ocols, a.label_col, cfg["resize"])
+        if cfg.get("shuffle_others", False) and not a.shuffle_others:
+            # footgun: an arm trained on broken pairing evaluated with true pairing is
+            # neither the lesion test nor the matched arm. Refuse rather than warn.
+            raise ValueError("checkpoint was TRAINED with --shuffle_others; pass --shuffle_others at eval "
+                             "for the matched arm (or evaluate a normally-trained checkpoint instead)")
+        if a.shuffle_others:
+            if cfg["control"] != "true_fakes":
+                raise ValueError(f"--shuffle_others requires a true_fakes checkpoint (got {cfg['control']})")
+            ds = ShuffledOthersDataset(ds, seed=a.shuffle_seed)
+            print(f"[gate eval] SHUFFLED others (derangement, seed={a.shuffle_seed}) -- diagnostic lesion test")
+        dl = DataLoader(ds, batch_size=a.batch_size, num_workers=4)
         acase, df, _ = evaluate_percase(model, dl, dev)
         df["control"] = cfg["control"]; df["seed"] = cfg["seed"]
+        df["eval_shuffle_others"] = bool(a.shuffle_others)
+        df["eval_shuffle_seed"] = a.shuffle_seed if a.shuffle_others else -1
+        df["train_shuffle_others"] = bool(cfg.get("shuffle_others", False))
         df["checkpoint_sha256"] = sha256_file(a.weights)
         df["source_checkpoint_sha256"] = cfg.get("source_ckpt_sha256")
         df["generator_checkpoint_sha256"] = cfg.get("generator_ckpt_sha256")
@@ -243,6 +311,7 @@ def main():
                "generator_ckpt_sha256": sha256_file(a.generator_ckpt), "backbone": a.backbone,
                "pretrained": a.pretrained, "adapter_backbone": a.adapter_backbone, "dim": a.dim, "heads": a.heads,
                "proj_dim": a.proj_dim, "stat_prior": False, "src_mean": 0.0, "src_std": 1.0,
+               "fusion_mode": a.fusion_mode, "shuffle_others": False, "shuffle_seed": -1,
                "before_col": a.before_col, "other_cols": a.other_cols, "resize": a.resize, "seed": a.seed}
         torch.save({"model": model.state_dict(), "config": cfg, "epoch": 0, "val_auc": float("nan")},
                    os.path.join(a.out_dir, "best.pt"))
@@ -255,23 +324,34 @@ def main():
         src_stats = _compute_before_stats(a.train_csv, a.before_col, a.resize)
     model = FusionGate(a.source_ckpt, control=a.control, backbone=a.backbone, pretrained=a.pretrained,
                        adapter_backbone=a.adapter_backbone, dim=a.dim, heads=a.heads, proj_dim=a.proj_dim,
-                       stat_prior=a.stat_prior, src_mean=src_stats[0], src_std=src_stats[1]).to(dev)
+                       stat_prior=a.stat_prior, src_mean=src_stats[0], src_std=src_stats[1],
+                       fusion_mode=a.fusion_mode).to(dev)
     print(f"[gate] control={a.control} source={Path(a.source_ckpt).name} "
           f"trainable={sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 
-    tr = DataLoader(MultiImageDataset(a.train_csv, a.before_col, others, a.label_col, a.resize, True),
-                    batch_size=a.batch_size, shuffle=True, num_workers=4,
+    tr_ds = MultiImageDataset(a.train_csv, a.before_col, others, a.label_col, a.resize, True)
+    va_ds = MultiImageDataset(a.val_csv, a.before_col, others, a.label_col, a.resize)
+    if a.shuffle_others:
+        # NOTE: with a shuffled pairing the train-time flip decision is no longer shared
+        # between `before` and `others` -- harmless here (they are different cases, so
+        # there is no geometric correspondence left to preserve), but it is a difference
+        # from the true_fakes arm and is recorded in the config.
+        tr_ds = ShuffledOthersDataset(tr_ds, seed=a.shuffle_seed)
+        va_ds = ShuffledOthersDataset(va_ds, seed=a.shuffle_seed)
+        print(f"[gate] SHUFFLED others at TRAIN+VAL (derangement, seed={a.shuffle_seed})")
+    tr = DataLoader(tr_ds, batch_size=a.batch_size, shuffle=True, num_workers=4,
                     generator=torch.Generator().manual_seed(a.seed))
-    va = DataLoader(MultiImageDataset(a.val_csv, a.before_col, others, a.label_col, a.resize),
-                    batch_size=a.batch_size, num_workers=4)
+    va = DataLoader(va_ds, batch_size=a.batch_size, num_workers=4)
     params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=1e-4)
     use_sc = a.supcon_weight > 0
     cfg = {"control": a.control, "source_ckpt": a.source_ckpt, "source_ckpt_sha256": sha256_file(a.source_ckpt),
            "generator_ckpt_sha256": sha256_file(a.generator_ckpt), "backbone": a.backbone, "pretrained": a.pretrained,
            "adapter_backbone": a.adapter_backbone, "dim": a.dim, "heads": a.heads, "proj_dim": a.proj_dim,
-           "fusion_mode": "orig_kv", "stat_prior": a.stat_prior, "src_mean": src_stats[0], "src_std": src_stats[1],
-           "before_col": a.before_col, "other_cols": a.other_cols, "resize": a.resize, "seed": a.seed}
+           "fusion_mode": a.fusion_mode, "stat_prior": a.stat_prior, "src_mean": src_stats[0], "src_std": src_stats[1],
+           "before_col": a.before_col, "other_cols": a.other_cols, "resize": a.resize, "seed": a.seed,
+           "shuffle_others": bool(a.shuffle_others), "shuffle_seed": a.shuffle_seed if a.shuffle_others else -1,
+           "train_csv": a.train_csv, "val_csv": a.val_csv}
     best = -1
     for ep in range(1, a.epochs + 1):
         model.train()
