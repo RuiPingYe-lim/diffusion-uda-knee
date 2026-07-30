@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Export a source diagnostic classifier as a UNSB-compatible TorchScript teacher."""
+"""Export a source diagnostic classifier as a UNSB-compatible TorchScript teacher.
+
+The exported module is consumed by ``dosc_modules.diagnostic_non_degradation_loss``, which
+scores the TRANSLATED image. A teacher trained on raw source PNGs only is out of
+distribution on that rendering (measured here: acc 0.984 raw vs 0.578 on the 256px
+generator-input rendering), and then the margin term penalises appearance change instead of
+diagnostic damage -- a leash toward the identity mapping. Export the checkpoint produced by
+``scripts/train_render_robust_teacher.py``, whose summary reports per-rendering AUC; the
+per-rendering block is copied into the metadata below so a mis-scoped teacher is visible at
+a glance instead of silently distorting training.
+"""
 
 from __future__ import annotations
 
@@ -21,7 +31,12 @@ from eval_existing_classifier_on_csv import build_model
 
 
 class UNSBDiagnosticTeacher(nn.Module):
-    """Adapt UNSB [-1, 1] tensors to the source classifier input contract."""
+    """Adapt UNSB [-1, 1] tensors to the source classifier input contract.
+
+    The classifier was trained behind ``Resize((S, S), antialias=True)``, so the resize here
+    is antialiased too. Without it, downsampling 256 -> 224 aliases the speckle the teacher
+    reads, which shifts the margin for reasons that have nothing to do with the lesion.
+    """
 
     def __init__(self, classifier: nn.Module, image_size: int) -> None:
         super().__init__()
@@ -34,6 +49,7 @@ class UNSBDiagnosticTeacher(nn.Module):
             size=(self.image_size, self.image_size),
             mode="bilinear",
             align_corners=False,
+            antialias=True,
         )
         return self.classifier(image)
 
@@ -111,7 +127,24 @@ def main() -> None:
         "image_size": args.image_size,
         "input_contract": "B3HW float tensor in [-1,1]",
         "output_contract": "unnormalized class logits",
+        "resize": "bilinear, antialias=True (matches the classifier's training transform)",
     }
+    # Carry the per-rendering validation through, so anyone reading the exported teacher can
+    # see whether it was ever validated on translated images.
+    renderings = checkpoint.get("val_metrics") if isinstance(checkpoint, dict) else None
+    if isinstance(renderings, dict):
+        metadata["source_val_per_rendering"] = renderings
+        aucs = [v.get("auc") for v in renderings.values() if isinstance(v, dict) and "auc" in v]
+        if aucs:
+            metadata["worst_rendering_auc"] = min(aucs)
+            if len(aucs) == 1:
+                print("[warn] teacher was validated on ONE rendering only; if that rendering is "
+                      "raw source PNGs it is out of distribution on translated images")
+    else:
+        print("[warn] checkpoint carries no per-rendering validation. If this teacher was "
+              "trained on raw source images only, the DOSC margin term will penalise "
+              "appearance change rather than diagnostic damage. See "
+              "scripts/train_render_robust_teacher.py")
     metadata_path = args.out.with_suffix(args.out.suffix + ".json")
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print(f"Saved teacher: {args.out}")
