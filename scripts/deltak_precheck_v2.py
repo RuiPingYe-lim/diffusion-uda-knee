@@ -1,5 +1,22 @@
 #!/usr/bin/env python
-"""Delta_k operand pre-check v2 -- corrected after the endpoint-vs-state critique.
+"""RETRACTED -- kept for provenance. DO NOT cite its numbers. See scripts/v8_path_corrected.py.
+
+x0 is read from ``cache/fusion_train_busi.csv:before_png``, which is NOT the source image but
+``results_u2b_rev/.../fake_5/`` -- BUSI already translated five bridge steps toward BrEaST.
+The whole "path" measured below therefore starts from an already-translated image. The true
+source rendering is ``da_route/da_manifest.csv:raw``; check pixel statistics, not column
+names (raw: mean 64.52 / std 55.70; before_png: 55.87 / 34.93).
+
+This file's headline verdict -- "steps 2-5 sit at SNR<=1 and do NOT progress toward the
+target, so the multi-step premise fails" -- is RETRACTED. Re-run from the correct x0
+(v8_path_corrected.py), the endpoint sequence progresses MONOTONICALLY on both domain
+measures: class-conditional coverage 0.19 -> 0.39 (benign) and 0.31 -> 0.52 (malignant),
+domain-probe logit -9.33 -> -2.09. What is really there is a monotone trade-off, deeper
+steps buying domain coverage at the cost of recoverable content (probe AUC 0.782 -> 0.686).
+
+--- original docstring below ---
+
+Delta_k operand pre-check v2 -- corrected after the endpoint-vs-state critique.
 
 FIXES over v1:
  1. Capture BOTH the true bridge states Xt AND the endpoint predictions prev=G(Xt,.).

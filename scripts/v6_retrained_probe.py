@@ -1,5 +1,21 @@
 #!/usr/bin/env python
-"""STEP 2 (correct): retrained-probe analysis of U1, valid ON the translated rendering.
+"""RETRACTED -- kept for provenance. DO NOT cite its numbers. See scripts/v7_corrected.py.
+
+The probe methodology here is sound; the INPUT is not. x0 is read from
+``cache/fusion_train_busi.csv:before_png``, which is not the source image but
+``results_u2b_rev/.../fake_5/`` -- BUSI already translated five bridge steps toward BrEaST.
+The true source rendering is ``da_route/da_manifest.csv:raw``.
+
+Corrected values (v7_corrected.py): probe(x0)->x0 0.823 (not 0.652), probe(U1)->U1 0.780
+(not 0.615), probe(x0)->U1 0.604; class-conditional dom_cover +0.187 / +0.315 (not
++0.030 / +0.033); domain-probe P(target) 0.001 -> 0.107 (not unmoved). The pre-registered
+downgrade triggered by this file -- "only ~3% domain progression, therefore the residual
+repair idea is not domain transport" -- is WITHDRAWN: a retrained probe loses only 0.043 AUC
+across the translation while 19-32% of the class-conditional domain gap is covered.
+
+--- original docstring below ---
+
+STEP 2: retrained-probe analysis of U1, valid ON the translated rendering.
 
 The frozen gate clf is OOD on before_png/fake (acc 0.58). So we probe with RENDERING-ROBUST
 ImageNet-frozen pooled features + a light linear probe fit on source labels (5-fold), which is
