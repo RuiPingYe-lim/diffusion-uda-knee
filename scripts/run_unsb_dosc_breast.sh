@@ -14,6 +14,10 @@ N_EPOCHS="${N_EPOCHS:-15}"
 N_EPOCHS_DECAY="${N_EPOCHS_DECAY:-15}"
 NUM_TEST="${NUM_TEST:-99999}"
 STYLE_DIM="${STYLE_DIM:-128}"
+CIDP_QUEUE_SIZE="${CIDP_QUEUE_SIZE:-128}"
+CIDP_MIN_PER_CLASS="${CIDP_MIN_PER_CLASS:-8}"
+CIDP_RANK_WEIGHT="${CIDP_RANK_WEIGHT:-1.0}"
+CIDP_RANK_TOLERANCE="${CIDP_RANK_TOLERANCE:-0.10}"
 
 export PYTHONPATH="${UNSB_ROOT}:${PYTHONPATH:-}"
 
@@ -33,8 +37,13 @@ python "${UNSB_ROOT}/train.py" \
   --lambda_DOSC_instance 0.10 \
   --lambda_DOSC_recon 1.00 \
   --lambda_DOSC_safe 0.50 \
+  --dosc_safe_mode cidp \
   --dosc_safe_tolerance 0.10 \
   --dosc_safe_warmup_steps 1000 \
+  --dosc_cidp_queue_size "${CIDP_QUEUE_SIZE}" \
+  --dosc_cidp_min_per_class "${CIDP_MIN_PER_CLASS}" \
+  --dosc_cidp_rank_weight "${CIDP_RANK_WEIGHT}" \
+  --dosc_cidp_rank_tolerance "${CIDP_RANK_TOLERANCE}" \
   --mode sb \
   --lambda_SB 1.0 \
   --lambda_NCE 1.0 \

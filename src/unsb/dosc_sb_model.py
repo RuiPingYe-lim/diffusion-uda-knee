@@ -11,6 +11,7 @@ from pathlib import Path
 import torch
 
 from .dosc_modules import (
+    CalibrationInvariantDiagnosticPreservation,
     DiagnosticOrthogonalConditioner,
     diagnostic_non_degradation_loss,
     parse_widths,
@@ -44,8 +45,25 @@ class DoscSBModel(SBModel):
         parser.add_argument("--lambda_DOSC_instance", type=float, default=0.10)
         parser.add_argument("--lambda_DOSC_recon", type=float, default=1.00)
         parser.add_argument("--lambda_DOSC_safe", type=float, default=0.50)
+        parser.add_argument(
+            "--dosc_safe_mode",
+            type=str,
+            choices=("cidp", "legacy_margin"),
+            default="cidp",
+            help=(
+                "cidp removes positive affine teacher-score drift before applying "
+                "margin and rank non-degradation; legacy_margin is retained for ablation"
+            ),
+        )
         parser.add_argument("--dosc_safe_tolerance", type=float, default=0.10)
         parser.add_argument("--dosc_safe_warmup_steps", type=int, default=1000)
+        parser.add_argument("--dosc_cidp_queue_size", type=int, default=128)
+        parser.add_argument("--dosc_cidp_min_per_class", type=int, default=8)
+        parser.add_argument("--dosc_cidp_affine_ridge", type=float, default=1e-4)
+        parser.add_argument("--dosc_cidp_min_scale", type=float, default=0.05)
+        parser.add_argument("--dosc_cidp_max_scale", type=float, default=20.0)
+        parser.add_argument("--dosc_cidp_rank_weight", type=float, default=1.0)
+        parser.add_argument("--dosc_cidp_rank_tolerance", type=float, default=0.10)
         parser.add_argument(
             "--dosc_teacher_path",
             type=str,
@@ -69,6 +87,17 @@ class DoscSBModel(SBModel):
             raise ValueError("DoscSBModel requires num_timesteps >= 2")
         if not 0.0 <= float(opt.dosc_noise_ratio) <= 1.0:
             raise ValueError("dosc_noise_ratio must be in [0, 1]")
+        if (
+            bool(opt.isTrain)
+            and float(opt.lambda_DOSC_safe) > 0.0
+            and str(opt.dosc_safe_mode) == "cidp"
+            and int(opt.dosc_num_classes) != 2
+        ):
+            raise ValueError("CIDP currently requires dosc_num_classes=2")
+        if float(opt.dosc_cidp_rank_weight) < 0.0:
+            raise ValueError("dosc_cidp_rank_weight must be non-negative")
+        if float(opt.dosc_cidp_rank_tolerance) < 0.0:
+            raise ValueError("dosc_cidp_rank_tolerance must be non-negative")
 
         super().__init__(opt)
         self.netS = DiagnosticOrthogonalConditioner(
@@ -89,6 +118,7 @@ class DoscSBModel(SBModel):
         self._nce_condition_index = 0
 
         self.netTeacher = None
+        self.netP = None
         if self.isTrain:
             self.loss_names += [
                 "DOSC_diag",
@@ -96,7 +126,15 @@ class DoscSBModel(SBModel):
                 "DOSC_instance",
                 "DOSC_recon",
                 "DOSC_safe",
+                "DOSC_safe_margin",
+                "DOSC_safe_rank",
                 "DOSC_margin_drop",
+                "DOSC_raw_margin_drop",
+                "DOSC_affine_scale",
+                "DOSC_affine_bias",
+                "DOSC_cidp_ready",
+                "DOSC_safe_c0",
+                "DOSC_safe_c1",
                 "DOSC_removed",
                 "DOSC_diag_acc",
                 "DOSC_domain_acc",
@@ -111,6 +149,15 @@ class DoscSBModel(SBModel):
             )
             self.optimizers.append(self.optimizer_S)
             self.netTeacher = self._load_teacher_if_required(opt)
+            if self.netTeacher is not None and str(opt.dosc_safe_mode) == "cidp":
+                self.netP = CalibrationInvariantDiagnosticPreservation(
+                    queue_size=opt.dosc_cidp_queue_size,
+                    min_per_class=opt.dosc_cidp_min_per_class,
+                    affine_ridge=opt.dosc_cidp_affine_ridge,
+                    min_scale=opt.dosc_cidp_min_scale,
+                    max_scale=opt.dosc_cidp_max_scale,
+                ).to(self.device)
+                self.model_names.append("P")
 
     def _load_teacher_if_required(self, opt):
         teacher_path = str(opt.dosc_teacher_path).strip()
@@ -131,6 +178,11 @@ class DoscSBModel(SBModel):
 
     def _style_module(self) -> DiagnosticOrthogonalConditioner:
         return self.netS.module if hasattr(self.netS, "module") else self.netS
+
+    def _cidp_module(self) -> CalibrationInvariantDiagnosticPreservation:
+        if self.netP is None:
+            raise RuntimeError("CIDP module is not initialized")
+        return self.netP.module if hasattr(self.netP, "module") else self.netP
 
     def set_input(self, input, input2=None):
         super().set_input(input, input2)
@@ -364,7 +416,9 @@ class DoscSBModel(SBModel):
             encode_only=True,
         )
         if self.opt.flip_equivariance and self.flipped_for_equivariance:
-            feature_query = [torch.flip(feature, dims=(3,)) for feature in feature_query]
+            feature_query = [
+                torch.flip(feature, dims=(3,)) for feature in feature_query
+            ]
         feature_key = self.netG(
             src,
             self.time_idx * 0,
@@ -401,19 +455,53 @@ class DoscSBModel(SBModel):
             self.real_B,
         )
 
+        zero = self.fake_B.sum() * 0.0
+        self.loss_DOSC_safe = zero
+        self.loss_DOSC_safe_margin = zero
+        self.loss_DOSC_safe_rank = zero
+        self.loss_DOSC_margin_drop = zero.detach()
+        self.loss_DOSC_raw_margin_drop = zero.detach()
+        self.loss_DOSC_affine_scale = zero.detach() + 1.0
+        self.loss_DOSC_affine_bias = zero.detach()
+        self.loss_DOSC_cidp_ready = zero.detach()
+        self.loss_DOSC_safe_c0 = zero.detach()
+        self.loss_DOSC_safe_c1 = zero.detach()
+
         if self.netTeacher is not None:
-            self.loss_DOSC_safe, self.loss_DOSC_margin_drop = (
-                diagnostic_non_degradation_loss(
+            if str(self.opt.dosc_safe_mode) == "cidp":
+                cidp = self._cidp_module()(
+                    self.netTeacher,
+                    self.real_A,
+                    self.fake_B,
+                    self.real_A_label,
+                    margin_tolerance=self.opt.dosc_safe_tolerance,
+                    rank_tolerance=self.opt.dosc_cidp_rank_tolerance,
+                    rank_weight=self.opt.dosc_cidp_rank_weight,
+                    update_queue=True,
+                )
+                self.loss_DOSC_safe = cidp["loss"]
+                self.loss_DOSC_safe_margin = cidp["margin_loss"]
+                self.loss_DOSC_safe_rank = cidp["rank_loss"]
+                self.loss_DOSC_margin_drop = cidp["margin_drop"]
+                self.loss_DOSC_raw_margin_drop = cidp["raw_margin_drop"]
+                self.loss_DOSC_affine_scale = cidp["affine_scale"]
+                self.loss_DOSC_affine_bias = cidp["affine_bias"]
+                self.loss_DOSC_cidp_ready = cidp["ready"]
+                self.loss_DOSC_safe_c0 = cidp["class0_charge"]
+                self.loss_DOSC_safe_c1 = cidp["class1_charge"]
+            else:
+                (
+                    self.loss_DOSC_safe,
+                    self.loss_DOSC_margin_drop,
+                ) = diagnostic_non_degradation_loss(
                     self.netTeacher,
                     self.real_A,
                     self.fake_B,
                     self.real_A_label,
                     tolerance=self.opt.dosc_safe_tolerance,
                 )
-            )
-        else:
-            self.loss_DOSC_safe = self.fake_B.sum() * 0.0
-            self.loss_DOSC_margin_drop = self.loss_DOSC_safe.detach()
+                self.loss_DOSC_safe_margin = self.loss_DOSC_safe
+                self.loss_DOSC_raw_margin_drop = self.loss_DOSC_margin_drop
 
         safe_scale = style_module.warmup_scale(self.opt.dosc_safe_warmup_steps)
         dosc_loss = (
@@ -421,9 +509,7 @@ class DoscSBModel(SBModel):
             + float(self.opt.lambda_DOSC_domain) * self.loss_DOSC_domain
             + float(self.opt.lambda_DOSC_instance) * self.loss_DOSC_instance
             + float(self.opt.lambda_DOSC_recon) * self.loss_DOSC_recon
-            + safe_scale
-            * float(self.opt.lambda_DOSC_safe)
-            * self.loss_DOSC_safe
+            + safe_scale * float(self.opt.lambda_DOSC_safe) * self.loss_DOSC_safe
         )
         self.loss_G = base_loss + dosc_loss
         return self.loss_G
@@ -434,6 +520,8 @@ class DoscSBModel(SBModel):
         self.netD.train()
         self.netF.train()
         self.netS.train()
+        if self.netP is not None:
+            self.netP.train()
         self.forward()
 
         self.set_requires_grad(self.netD, True)

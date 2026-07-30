@@ -22,7 +22,7 @@ and diagnostic experiments that motivated the design.
    original image as query, cross-attending to translated / sampled views.
 5. **Diagnostic-orthogonal target-style conditioning** (`src/unsb/DOSC.md`) — replace UNSB random
    style noise with an unlabeled target exemplar, remove the source diagnostic subspace, and enforce
-   target-domain retention plus source-label margin non-degradation.
+   target-domain retention plus calibration-invariant margin and rank non-degradation (CIDP).
 
 ## Repository layout
 

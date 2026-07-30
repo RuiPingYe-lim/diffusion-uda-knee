@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Export a source diagnostic classifier as a UNSB-compatible TorchScript teacher.
+"""Export a diagnostic classifier as a UNSB-compatible TorchScript teacher.
 
-The exported module is consumed by ``dosc_modules.diagnostic_non_degradation_loss``, which
-scores the TRANSLATED image. A teacher trained on raw source PNGs only is out of
-distribution on that rendering (measured here: acc 0.984 raw vs 0.578 on the 256px
-generator-input rendering), and then the margin term penalises appearance change instead of
-diagnostic damage -- a leash toward the identity mapping. Export the checkpoint produced by
-``scripts/train_render_robust_teacher.py``, whose summary reports per-rendering AUC; the
-per-rendering block is copied into the metadata below so a mis-scoped teacher is visible at
-a glance instead of silently distorting training.
+The 128px source PNG and its 256px UNSB source rendering have matched
+performance; resolution is not the failure mode. Translation instead causes
+both score calibration drift and local ranking loss. Export the checkpoint
+produced by ``scripts/train_render_robust_teacher.py`` and use it with CIDP,
+which removes positive affine score drift before applying margin and rank
+non-degradation. Per-rendering validation is copied into the metadata so the
+teacher's scope remains auditable.
 """
 
 from __future__ import annotations
@@ -27,15 +26,14 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from eval_existing_classifier_on_csv import build_model
+from eval_existing_classifier_on_csv import build_model  # noqa: E402
 
 
 class UNSBDiagnosticTeacher(nn.Module):
     """Adapt UNSB [-1, 1] tensors to the source classifier input contract.
 
-    The classifier was trained behind ``Resize((S, S), antialias=True)``, so the resize here
-    is antialiased too. Without it, downsampling 256 -> 224 aliases the speckle the teacher
-    reads, which shifts the margin for reasons that have nothing to do with the lesion.
+    The classifier was trained behind ``Resize((S, S), antialias=True)``, so
+    the resize here uses the same input contract.
     """
 
     def __init__(self, classifier: nn.Module, image_size: int) -> None:
@@ -97,7 +95,9 @@ def main() -> None:
             f"missing={load_result.missing_keys}, unexpected={load_result.unexpected_keys}"
         )
 
-    wrapper = UNSBDiagnosticTeacher(classifier.eval(), args.image_size).to(device).eval()
+    wrapper = (
+        UNSBDiagnosticTeacher(classifier.eval(), args.image_size).to(device).eval()
+    )
     for parameter in wrapper.parameters():
         parameter.requires_grad_(False)
     example = torch.zeros(
@@ -128,23 +128,33 @@ def main() -> None:
         "input_contract": "B3HW float tensor in [-1,1]",
         "output_contract": "unnormalized class logits",
         "resize": "bilinear, antialias=True (matches the classifier's training transform)",
+        "recommended_safety_mode": "cidp",
     }
+    protocol = checkpoint.get("data_protocol") if isinstance(checkpoint, dict) else None
+    if isinstance(protocol, dict):
+        metadata["data_protocol"] = protocol
     # Carry the per-rendering validation through, so anyone reading the exported teacher can
     # see whether it was ever validated on translated images.
     renderings = checkpoint.get("val_metrics") if isinstance(checkpoint, dict) else None
     if isinstance(renderings, dict):
         metadata["source_val_per_rendering"] = renderings
-        aucs = [v.get("auc") for v in renderings.values() if isinstance(v, dict) and "auc" in v]
+        aucs = [
+            v.get("auc")
+            for v in renderings.values()
+            if isinstance(v, dict) and "auc" in v
+        ]
         if aucs:
             metadata["worst_rendering_auc"] = min(aucs)
             if len(aucs) == 1:
-                print("[warn] teacher was validated on ONE rendering only; if that rendering is "
-                      "raw source PNGs it is out of distribution on translated images")
+                print(
+                    "[warn] teacher was validated on one rendering only; "
+                    "CIDP should use a teacher validated on source and translated renderings"
+                )
     else:
-        print("[warn] checkpoint carries no per-rendering validation. If this teacher was "
-              "trained on raw source images only, the DOSC margin term will penalise "
-              "appearance change rather than diagnostic damage. See "
-              "scripts/train_render_robust_teacher.py")
+        print(
+            "[warn] checkpoint carries no per-rendering validation; "
+            "run scripts/train_render_robust_teacher.py and v10_heldout.py first"
+        )
     metadata_path = args.out.with_suffix(args.out.suffix + ".json")
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print(f"Saved teacher: {args.out}")

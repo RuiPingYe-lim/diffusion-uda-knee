@@ -16,6 +16,7 @@ except ModuleNotFoundError:
 
 if torch is not None:
     from dosc_modules import (
+        CalibrationInvariantDiagnosticPreservation,
         DiagnosticOrthogonalConditioner,
         DiagnosticSubspaceProjector,
         diagnostic_non_degradation_loss,
@@ -107,6 +108,117 @@ class DiagnosticOrthogonalModuleTests(unittest.TestCase):
         loss.backward()
         self.assertIsNotNone(translated.grad)
         self.assertTrue(torch.isfinite(translated.grad).all())
+
+    def test_cidp_ignores_positive_affine_score_drift(self):
+        cidp = CalibrationInvariantDiagnosticPreservation(
+            queue_size=8,
+            min_per_class=1,
+            affine_ridge=0.0,
+        )
+        source_score = torch.tensor([-3.0, -2.0, 2.0, 3.0])
+        translated_score = ((source_score - 4.0) / 2.0).requires_grad_()
+        labels = torch.tensor([0, 0, 1, 1])
+
+        result = cidp.forward_scores(
+            source_score,
+            translated_score,
+            labels,
+            margin_tolerance=1e-5,
+            rank_tolerance=1e-5,
+        )
+
+        self.assertEqual(float(result["ready"]), 1.0)
+        self.assertAlmostEqual(float(result["affine_scale"]), 2.0, places=5)
+        self.assertAlmostEqual(float(result["affine_bias"]), 4.0, places=5)
+        self.assertLess(float(result["loss"]), 1e-5)
+        self.assertLess(float(result["class0_charge"]), 1e-5)
+        self.assertLess(float(result["class1_charge"]), 1e-5)
+        self.assertFalse(result["affine_scale"].requires_grad)
+        self.assertFalse(result["affine_bias"].requires_grad)
+        result["loss"].backward()
+        self.assertIsNotNone(translated_score.grad)
+        self.assertTrue(torch.isfinite(translated_score.grad).all())
+
+    def test_cidp_rank_term_penalizes_local_ordering_damage(self):
+        cidp = CalibrationInvariantDiagnosticPreservation(
+            queue_size=8,
+            min_per_class=1,
+            affine_ridge=0.0,
+        )
+        source_score = torch.tensor([-3.0, -2.0, 2.0, 3.0])
+        translated_score = torch.tensor(
+            [-3.0, 1.0, -1.0, 3.0],
+            requires_grad=True,
+        )
+        labels = torch.tensor([0, 0, 1, 1])
+
+        result = cidp.forward_scores(
+            source_score,
+            translated_score,
+            labels,
+            margin_tolerance=100.0,
+            rank_tolerance=0.1,
+        )
+
+        self.assertEqual(float(result["ready"]), 1.0)
+        self.assertEqual(float(result["margin_loss"]), 0.0)
+        self.assertGreater(float(result["rank_loss"]), 0.0)
+        result["loss"].backward()
+        self.assertIsNotNone(translated_score.grad)
+        self.assertGreater(float(translated_score.grad.abs().sum()), 0.0)
+        self.assertTrue(torch.isfinite(translated_score.grad).all())
+
+    def test_cidp_waits_for_both_class_queues(self):
+        cidp = CalibrationInvariantDiagnosticPreservation(
+            queue_size=8,
+            min_per_class=2,
+            affine_ridge=0.0,
+        )
+        labels = torch.tensor([0, 1])
+        first = cidp.forward_scores(
+            torch.tensor([-2.0, 2.0]),
+            torch.tensor([-4.0, 0.0], requires_grad=True),
+            labels,
+        )
+        second = cidp.forward_scores(
+            torch.tensor([-3.0, 3.0]),
+            torch.tensor([-5.0, 1.0], requires_grad=True),
+            labels,
+        )
+
+        self.assertEqual(float(first["ready"]), 0.0)
+        self.assertEqual(float(first["loss"]), 0.0)
+        self.assertEqual(float(second["ready"]), 1.0)
+        self.assertTrue(torch.equal(cidp.score_queue.counts, torch.tensor([2, 2])))
+
+    def test_cidp_queue_round_trips_through_state_dict(self):
+        original = CalibrationInvariantDiagnosticPreservation(
+            queue_size=8,
+            min_per_class=1,
+        )
+        original.forward_scores(
+            torch.tensor([-2.0, 2.0]),
+            torch.tensor([-3.0, 1.0], requires_grad=True),
+            torch.tensor([0, 1]),
+        )
+        restored = CalibrationInvariantDiagnosticPreservation(
+            queue_size=8,
+            min_per_class=1,
+        )
+        restored.load_state_dict(original.state_dict())
+
+        self.assertTrue(
+            torch.equal(
+                original.score_queue.counts,
+                restored.score_queue.counts,
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                original.score_queue.translated_scores,
+                restored.score_queue.translated_scores,
+            )
+        )
 
 
 if __name__ == "__main__":

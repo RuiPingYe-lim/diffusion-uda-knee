@@ -76,7 +76,9 @@ class MultiScaleMomentStyleEncoder(nn.Module):
         return_descriptor: bool = False,
     ):
         if image.ndim != 4:
-            raise ValueError(f"Expected BCHW image tensor, got shape={tuple(image.shape)}")
+            raise ValueError(
+                f"Expected BCHW image tensor, got shape={tuple(image.shape)}"
+            )
         feature = image
         moments = []
         for block in self.blocks:
@@ -117,8 +119,12 @@ class DiagnosticSubspaceProjector(nn.Module):
         self.momentum = float(momentum)
         self.eps = float(eps)
         max_rank = self.num_classes - 1
-        self.register_buffer("class_means", torch.zeros(self.num_classes, self.style_dim))
-        self.register_buffer("class_initialized", torch.zeros(self.num_classes, dtype=torch.bool))
+        self.register_buffer(
+            "class_means", torch.zeros(self.num_classes, self.style_dim)
+        )
+        self.register_buffer(
+            "class_initialized", torch.zeros(self.num_classes, dtype=torch.bool)
+        )
         self.register_buffer("basis", torch.zeros(max_rank, self.style_dim))
         self.register_buffer("basis_rank", torch.zeros((), dtype=torch.long))
 
@@ -211,7 +217,9 @@ class ReferenceStyleQueue(nn.Module):
             pointer = int(self.queue_pointer.item())
             self.queue[pointer].copy_(row)
             self.queue_pointer.fill_((pointer + 1) % self.queue_size)
-            self.queue_count.fill_(min(int(self.queue_count.item()) + 1, self.queue_size))
+            self.queue_count.fill_(
+                min(int(self.queue_count.item()) + 1, self.queue_size)
+            )
 
     def active(self) -> torch.Tensor:
         count = int(self.queue_count.item())
@@ -261,7 +269,9 @@ class DiagnosticOrthogonalConditioner(nn.Module):
             nn.LeakyReLU(0.2, inplace=True),
             nn.Linear(self.generator_style_dim, self.generator_style_dim),
         )
-        self.reference_queue = ReferenceStyleQueue(self.style_dim, queue_size=queue_size)
+        self.reference_queue = ReferenceStyleQueue(
+            self.style_dim, queue_size=queue_size
+        )
         self.register_buffer("training_step", torch.zeros((), dtype=torch.long))
 
     def encode_raw(self, image: torch.Tensor) -> torch.Tensor:
@@ -309,8 +319,12 @@ class DiagnosticOrthogonalConditioner(nn.Module):
         if update_projector and self.enable_projection:
             self.projector.update(source_raw.detach(), source_labels.detach())
 
-        source_style = self.projector(source_raw) if self.enable_projection else source_raw
-        target_style = self.projector(target_raw) if self.enable_projection else target_raw
+        source_style = (
+            self.projector(source_raw) if self.enable_projection else source_raw
+        )
+        target_style = (
+            self.projector(target_raw) if self.enable_projection else target_raw
+        )
         valid = (source_labels >= 0) & (source_labels < self.num_classes)
         if torch.any(valid):
             diagnostic_logits = self.diagnostic_head(
@@ -318,8 +332,8 @@ class DiagnosticOrthogonalConditioner(nn.Module):
             )
             diagnostic_loss = F.cross_entropy(diagnostic_logits, source_labels[valid])
             diagnostic_accuracy = (
-                diagnostic_logits.argmax(dim=1) == source_labels[valid]
-            ).float().mean()
+                (diagnostic_logits.argmax(dim=1) == source_labels[valid]).float().mean()
+            )
         else:
             diagnostic_loss = source_style.sum() * 0.0
             diagnostic_accuracy = source_style.new_tensor(float("nan"))
@@ -327,8 +341,12 @@ class DiagnosticOrthogonalConditioner(nn.Module):
         domain_style = torch.cat([source_style, target_style], dim=0)
         domain_labels = torch.cat(
             [
-                torch.zeros(source_style.shape[0], dtype=torch.long, device=source_style.device),
-                torch.ones(target_style.shape[0], dtype=torch.long, device=target_style.device),
+                torch.zeros(
+                    source_style.shape[0], dtype=torch.long, device=source_style.device
+                ),
+                torch.ones(
+                    target_style.shape[0], dtype=torch.long, device=target_style.device
+                ),
             ],
             dim=0,
         )
@@ -366,7 +384,9 @@ class DiagnosticOrthogonalConditioner(nn.Module):
     ) -> torch.Tensor:
         translated_style = F.normalize(self.encode_projected(translated_image), dim=1)
         with torch.no_grad():
-            reference_style = F.normalize(self.encode_projected(target_reference), dim=1)
+            reference_style = F.normalize(
+                self.encode_projected(target_reference), dim=1
+            )
         return (1.0 - (translated_style * reference_style).sum(dim=1)).mean()
 
     def mix_with_noise(
@@ -411,6 +431,364 @@ def true_class_margin(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tenso
     return true_logits - competing
 
 
+def binary_diagnostic_score(logits: torch.Tensor) -> torch.Tensor:
+    """Return the positive-versus-negative score ``z1 - z0``."""
+
+    if logits.ndim != 2 or logits.shape[1] != 2:
+        raise ValueError(
+            "CIDP requires binary teacher logits with shape [B,2], "
+            f"got {tuple(logits.shape)}"
+        )
+    return logits[:, 1] - logits[:, 0]
+
+
+class ClassBalancedScoreQueue(nn.Module):
+    """Keep an equal-capacity FIFO of detached score pairs for each class."""
+
+    def __init__(self, queue_size: int = 128, num_classes: int = 2) -> None:
+        super().__init__()
+        if int(num_classes) < 2:
+            raise ValueError("num_classes must be at least 2")
+        if int(queue_size) < int(num_classes):
+            raise ValueError("queue_size must be at least num_classes")
+        self.num_classes = int(num_classes)
+        self.capacity_per_class = int(queue_size) // self.num_classes
+        self.queue_size = self.capacity_per_class * self.num_classes
+        shape = (self.num_classes, self.capacity_per_class)
+        self.register_buffer("source_scores", torch.zeros(shape))
+        self.register_buffer("translated_scores", torch.zeros(shape))
+        self.register_buffer(
+            "pointers", torch.zeros(self.num_classes, dtype=torch.long)
+        )
+        self.register_buffer("counts", torch.zeros(self.num_classes, dtype=torch.long))
+
+    @torch.no_grad()
+    def enqueue(
+        self,
+        source_score: torch.Tensor,
+        translated_score: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> None:
+        source_score = source_score.detach().reshape(-1)
+        translated_score = translated_score.detach().reshape(-1)
+        labels = labels.detach().reshape(-1).long()
+        if not (source_score.shape == translated_score.shape == labels.shape):
+            raise ValueError("score pairs and labels must have the same shape")
+        valid = (labels >= 0) & (labels < self.num_classes)
+        for source_value, translated_value, label in zip(
+            source_score[valid],
+            translated_score[valid],
+            labels[valid],
+        ):
+            class_index = int(label.item())
+            pointer = int(self.pointers[class_index].item())
+            self.source_scores[class_index, pointer].copy_(source_value)
+            self.translated_scores[class_index, pointer].copy_(translated_value)
+            self.pointers[class_index] = (pointer + 1) % self.capacity_per_class
+            self.counts[class_index] = min(
+                int(self.counts[class_index].item()) + 1,
+                self.capacity_per_class,
+            )
+
+    def active(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        source_rows = []
+        translated_rows = []
+        label_rows = []
+        for class_index in range(self.num_classes):
+            count = int(self.counts[class_index].item())
+            if count == 0:
+                continue
+            source_rows.append(self.source_scores[class_index, :count])
+            translated_rows.append(self.translated_scores[class_index, :count])
+            label_rows.append(
+                torch.full(
+                    (count,),
+                    class_index,
+                    dtype=torch.long,
+                    device=self.source_scores.device,
+                )
+            )
+        if not source_rows:
+            empty_score = self.source_scores.new_empty((0,))
+            empty_label = self.counts.new_empty((0,))
+            return empty_score, empty_score.clone(), empty_label
+        return (
+            torch.cat(source_rows),
+            torch.cat(translated_rows),
+            torch.cat(label_rows),
+        )
+
+
+class CalibrationInvariantDiagnosticPreservation(nn.Module):
+    """Calibration-decoupled diagnostic non-degradation for binary diagnosis.
+
+    A positive affine map is fitted on detached source/translated teacher
+    scores from a class-balanced FIFO. The fitted map absorbs global offset and
+    temperature drift. A calibrated true-class margin term handles local
+    confidence loss, while a pairwise rank term preserves separability that no
+    threshold or positive affine map can recover.
+    """
+
+    def __init__(
+        self,
+        queue_size: int = 128,
+        min_per_class: int = 8,
+        affine_ridge: float = 1e-4,
+        min_scale: float = 0.05,
+        max_scale: float = 20.0,
+    ) -> None:
+        super().__init__()
+        if int(min_per_class) < 1:
+            raise ValueError("min_per_class must be positive")
+        if float(affine_ridge) < 0.0:
+            raise ValueError("affine_ridge must be non-negative")
+        if not 0.0 < float(min_scale) <= float(max_scale):
+            raise ValueError("CIDP scales must satisfy 0 < min_scale <= max_scale")
+        self.min_per_class = int(min_per_class)
+        self.affine_ridge = float(affine_ridge)
+        self.min_scale = float(min_scale)
+        self.max_scale = float(max_scale)
+        self.score_queue = ClassBalancedScoreQueue(
+            queue_size=int(queue_size),
+            num_classes=2,
+        )
+        if self.min_per_class > self.score_queue.capacity_per_class:
+            raise ValueError("min_per_class cannot exceed the per-class queue capacity")
+
+    @torch.no_grad()
+    def _estimate_affine(
+        self,
+        translated_score: torch.Tensor,
+        source_score: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Fit ``source ~= a * translated + b`` with equal class weight."""
+
+        translated_score = translated_score.detach().reshape(-1)
+        source_score = source_score.detach().reshape(-1)
+        labels = labels.detach().reshape(-1).long()
+        counts = torch.bincount(labels, minlength=2)
+        ready = torch.all(counts[:2] >= self.min_per_class)
+        if not bool(ready):
+            one = translated_score.new_tensor(1.0)
+            zero = translated_score.new_tensor(0.0)
+            return one, zero, zero
+
+        class_counts = counts[labels].to(dtype=translated_score.dtype)
+        weights = class_counts.reciprocal()
+        weights = weights / weights.sum().clamp_min(1e-12)
+        translated_mean = (weights * translated_score).sum()
+        source_mean = (weights * source_score).sum()
+        centered_translated = translated_score - translated_mean
+        centered_source = source_score - source_mean
+        variance = (weights * centered_translated.square()).sum()
+        covariance = (weights * centered_translated * centered_source).sum()
+        scale = covariance / (variance + self.affine_ridge)
+        scale = scale.clamp(self.min_scale, self.max_scale)
+        bias = source_mean - scale * translated_mean
+        return scale, bias, translated_score.new_tensor(1.0)
+
+    @staticmethod
+    def _binary_margin(score: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        sign = labels.to(dtype=score.dtype).mul(2.0).sub(1.0)
+        return sign * score
+
+    @staticmethod
+    def _rank_drop(
+        source_positive: torch.Tensor,
+        source_negative: torch.Tensor,
+        translated_positive: torch.Tensor,
+        translated_negative: torch.Tensor,
+        tolerance: float,
+    ) -> torch.Tensor:
+        if source_positive.numel() == 0 or source_negative.numel() == 0:
+            return translated_positive.new_empty((0,))
+        source_gap = source_positive[:, None] - source_negative[None, :]
+        translated_gap = translated_positive[:, None] - translated_negative[None, :]
+        # Do not preserve mistakes made by the frozen source teacher.
+        source_correct = source_gap > 0.0
+        if not torch.any(source_correct):
+            return translated_gap.new_empty((0,))
+        return F.relu(
+            source_gap.detach()[source_correct]
+            - translated_gap[source_correct]
+            - float(tolerance)
+        )
+
+    def _pairwise_rank_loss(
+        self,
+        source_score: torch.Tensor,
+        calibrated_score: torch.Tensor,
+        labels: torch.Tensor,
+        bank_source: torch.Tensor,
+        bank_calibrated: torch.Tensor,
+        bank_labels: torch.Tensor,
+        tolerance: float,
+    ) -> torch.Tensor:
+        current_positive = labels == 1
+        current_negative = labels == 0
+        bank_positive = bank_labels == 1
+        bank_negative = bank_labels == 0
+        drops = [
+            self._rank_drop(
+                source_score[current_positive],
+                source_score[current_negative],
+                calibrated_score[current_positive],
+                calibrated_score[current_negative],
+                tolerance,
+            ),
+            self._rank_drop(
+                source_score[current_positive],
+                bank_source[bank_negative],
+                calibrated_score[current_positive],
+                bank_calibrated[bank_negative],
+                tolerance,
+            ),
+            self._rank_drop(
+                bank_source[bank_positive],
+                source_score[current_negative],
+                bank_calibrated[bank_positive],
+                calibrated_score[current_negative],
+                tolerance,
+            ),
+        ]
+        non_empty = [drop for drop in drops if drop.numel() > 0]
+        if not non_empty:
+            return calibrated_score.sum() * 0.0
+        return torch.cat(non_empty).mean()
+
+    def forward_scores(
+        self,
+        source_score: torch.Tensor,
+        translated_score: torch.Tensor,
+        labels: torch.Tensor,
+        margin_tolerance: float = 0.1,
+        rank_tolerance: float = 0.1,
+        rank_weight: float = 1.0,
+        update_queue: bool = True,
+    ) -> dict[str, torch.Tensor]:
+        """Compute CIDP from paired teacher scores."""
+
+        source_score = source_score.reshape(-1)
+        translated_score = translated_score.reshape(-1)
+        labels = labels.reshape(-1).long()
+        if not (source_score.shape == translated_score.shape == labels.shape):
+            raise ValueError("score pairs and labels must have the same shape")
+        if torch.any((labels < 0) | (labels > 1)):
+            raise ValueError("CIDP accepts binary labels 0/1 only")
+        if source_score.numel() == 0:
+            zero = translated_score.sum() * 0.0
+            return {
+                "loss": zero,
+                "margin_loss": zero,
+                "rank_loss": zero,
+                "margin_drop": zero.detach(),
+                "raw_margin_drop": zero.detach(),
+                "affine_scale": zero.detach() + 1.0,
+                "affine_bias": zero.detach(),
+                "ready": zero.detach(),
+                "class0_charge": zero.detach(),
+                "class1_charge": zero.detach(),
+            }
+
+        bank_source, bank_translated, bank_labels = self.score_queue.active()
+        fit_source = torch.cat([bank_source, source_score.detach()])
+        fit_translated = torch.cat([bank_translated, translated_score.detach()])
+        fit_labels = torch.cat([bank_labels, labels.detach()])
+        scale, bias, ready = self._estimate_affine(
+            fit_translated,
+            fit_source,
+            fit_labels,
+        )
+        scale = scale.detach()
+        bias = bias.detach()
+        calibrated_score = scale * translated_score + bias
+        bank_calibrated = scale * bank_translated + bias
+
+        source_margin = self._binary_margin(source_score.detach(), labels)
+        raw_margin = self._binary_margin(translated_score, labels)
+        calibrated_margin = self._binary_margin(calibrated_score, labels)
+        margin_drop = source_margin - calibrated_margin
+        margin_charge = F.relu(margin_drop - float(margin_tolerance))
+        margin_loss = margin_charge.mean()
+        rank_loss = self._pairwise_rank_loss(
+            source_score.detach(),
+            calibrated_score,
+            labels,
+            bank_source,
+            bank_calibrated,
+            bank_labels,
+            tolerance=float(rank_tolerance),
+        )
+        total = ready * (margin_loss + float(rank_weight) * rank_loss)
+
+        class_charges = []
+        for class_index in range(2):
+            class_mask = labels == class_index
+            if torch.any(class_mask):
+                class_charges.append(margin_charge[class_mask].mean().detach())
+            else:
+                class_charges.append(margin_charge.new_tensor(0.0))
+
+        if update_queue:
+            self.score_queue.enqueue(
+                source_score,
+                translated_score,
+                labels,
+            )
+        raw_drop = source_margin - raw_margin
+        return {
+            "loss": total,
+            "margin_loss": ready * margin_loss,
+            "rank_loss": ready * rank_loss,
+            "margin_drop": margin_drop.mean().detach(),
+            "raw_margin_drop": raw_drop.mean().detach(),
+            "affine_scale": scale,
+            "affine_bias": bias,
+            "ready": ready,
+            "class0_charge": ready * class_charges[0],
+            "class1_charge": ready * class_charges[1],
+        }
+
+    def forward(
+        self,
+        teacher: nn.Module,
+        source_image: torch.Tensor,
+        translated_image: torch.Tensor,
+        source_labels: torch.Tensor,
+        margin_tolerance: float = 0.1,
+        rank_tolerance: float = 0.1,
+        rank_weight: float = 1.0,
+        update_queue: bool = True,
+    ) -> dict[str, torch.Tensor]:
+        labels = source_labels.reshape(-1).long()
+        valid = (labels >= 0) & (labels <= 1)
+        if not torch.any(valid):
+            zero = translated_image.sum() * 0.0
+            return self.forward_scores(
+                zero.new_empty((0,)),
+                zero.new_empty((0,)),
+                labels.new_empty((0,)),
+                margin_tolerance=margin_tolerance,
+                rank_tolerance=rank_tolerance,
+                rank_weight=rank_weight,
+                update_queue=False,
+            )
+        labels = labels[valid]
+        with torch.no_grad():
+            source_score = binary_diagnostic_score(teacher(source_image[valid]))
+        translated_score = binary_diagnostic_score(teacher(translated_image[valid]))
+        return self.forward_scores(
+            source_score,
+            translated_score,
+            labels,
+            margin_tolerance=margin_tolerance,
+            rank_tolerance=rank_tolerance,
+            rank_weight=rank_weight,
+            update_queue=update_queue,
+        )
+
+
 def diagnostic_non_degradation_loss(
     teacher: nn.Module,
     source_image: torch.Tensor,
@@ -421,7 +799,7 @@ def diagnostic_non_degradation_loss(
     """Penalize translated images whose true-label margin falls too far."""
 
     labels = source_labels.reshape(-1).long()
-    valid = (labels >= 0)
+    valid = labels >= 0
     if not torch.any(valid):
         zero = translated_image.sum() * 0.0
         return zero, zero.detach()
