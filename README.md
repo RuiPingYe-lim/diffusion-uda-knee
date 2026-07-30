@@ -20,6 +20,10 @@ and diagnostic experiments that motivated the design.
    alternatives (moment matching, histogram matching).
 4. **Cross-attention fusion classifier** (`src/bbdm_strict/fusion_classifier.py`) — classify using the
    original image as query, cross-attending to translated / sampled views.
+5. **Task-preserving path classifier (C2)** (`src/bbdm_strict/train_path_invariant_classifier.py`) —
+   use unlabeled target intensity statistics to build same-content source→target style paths, then
+   train the classifier to keep its label, prediction and deep feature stable along the path. Test
+   images are classified directly; neither the VAE nor the bridge is used at inference.
 
 ## Repository layout
 
@@ -53,6 +57,8 @@ src/
     ├── eval_late_fusion.py              # decision-level ensemble
     ├── source_style_stats.py            # shared, cached source intensity stats (moment matching)
     ├── eval_moment_self_oracle.py       # C1 diagnostic: direct/moment/moment+VAE/BBDM oracle + fidelity
+    ├── path_augmentation.py             # source→target linear/Brownian style-path construction
+    ├── train_path_invariant_classifier.py # C2 path CE + prediction/feature consistency
     ├── precompute_meanproj.py           # mean-projection preprocessing (paper-1 aligned pipeline)
     ├── train_eval_meanproj.py           # source-only train/eval on mean-projection representation
     └── configs/                          # BBDM / VAE configs (JSON; incl. moment_self diagnostics)
@@ -122,6 +128,45 @@ The `moment_self` dataset and the Oracle read **identical** cached source stats 
 (same n/seed/image_size); the legacy `eval_style_match.py` still computes its own stats, so its numbers
 are not directly comparable to the diagnostic.
 
+## C2 task-preserving path classifier
+
+C1 showed that a successful style endpoint and a useful multi-step translator are different questions:
+the VAE and reverse bridge can lose task information even when the intended intensity change is simple.
+C2 therefore moves generation to **training-time augmentation** and removes it from inference:
+
+```text
+labeled source x_s ── moment-match to one unlabeled target style ──> x_style
+                         │
+                         └── sample x_alpha along a linear/Brownian path
+
+train: CE(x_s,y) + CE(x_alpha,y) + prediction consistency + feature consistency
+test:  raw target x_t ──> classifier
+```
+
+The target training CSV contributes image mean/std values only; `pandas.read_csv(usecols=[image_col])`
+ensures its label values are never loaded. Checkpoint selection uses source validation AUC. The target
+test loader is constructed only after the selected checkpoint is reloaded. Every run records these
+restrictions in `config_used.json`.
+
+Run the four required controls with the same seed and training schedule:
+
+```bash
+bash scripts/run_path_invariant.sh \
+  <source_train.csv> <source_val.csv> <target_train_unlabeled.csv> \
+  <target_test.csv> <output_root> [source_test.csv]
+
+# Existing /root/autodl-tmp/meanproj_stage layout, forward M→K by default:
+bash scripts/run_path_invariant_knee.sh
+# Both directions and three fixed seeds:
+DIRECTIONS="m2k k2m" SEEDS="42 43 44" bash scripts/run_path_invariant_knee.sh
+```
+
+The modes have distinct roles: `none` is the matched source-only baseline, `endpoint` tests ordinary
+moment-style augmentation, `linear` tests whether intermediate domains help, and `brownian` tests the
+additional stochastic bridge. Do not call the path mechanism effective unless `linear` or `brownian`
+beats both `none` **and** `endpoint` across repeated seeds. A single best target-test run is exploratory,
+not a valid model-selection result.
+
 ## Notes
 
 - **UNSB comparison** (`src/unsb/`): a newer, sharper unpaired translator — Unpaired Neural Schrödinger
@@ -137,7 +182,7 @@ are not directly comparable to the diagnostic.
 - **Known limitations / WIP** (tracked from code review): `train_vqgan.py` does not yet wire the KLVAE
   training path; several `eval_*` scripts sweep hyper-parameters on target-test labels (exploratory
   only — final results must fix params in advance); the cross-attention fusion mixes source "other
-  views" produced by a target→source bridge (distribution mismatch — pending a source→target
-  augmentation redesign, see `gen_fusion_pairs.py`); SupCon uses a low-dim latent mean (should use
-  deep classifier features). See the commit history for fixes in progress.
+  views" produced by a target→source bridge (distribution mismatch — do not treat that fusion as the
+  C2 path method; C2 now has a separate source→target augmentation pipeline); SupCon uses a low-dim
+  latent mean (should use deep classifier features). See the commit history for fixes in progress.
 - Configs/scripts contain **absolute paths** — edit them for your environment.
