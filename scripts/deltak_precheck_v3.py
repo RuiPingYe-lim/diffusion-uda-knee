@@ -1,5 +1,22 @@
 #!/usr/bin/env python
-"""Delta_k pre-check v3 -- targets DA-BRF's ACTUAL operand and fixes 'toward target'.
+"""RETRACTED -- kept for provenance. DO NOT cite its numbers. See scripts/v7_corrected.py.
+
+x0 is read from ``cache/fusion_train_busi.csv:before_png``, which is NOT the source image but
+``results_u2b_rev/.../fake_5/`` -- BUSI already translated five bridge steps toward BrEaST.
+So ``Delta_trans = F(U1) - F(x0)`` as computed here is really F(G(fake_5)) - F(fake_5): a
+second translation pass on an already-translated image. The true source rendering is
+``da_route/da_manifest.csv:raw`` (mean 64.52 / std 55.70 vs before_png's 55.87 / 34.93).
+
+Every domain-progression number below is wrong by roughly an order of magnitude. Corrected
+(v7_corrected.py): class-conditional dom_cover +0.187 (benign) / +0.315 (malignant) rather
+than +0.016 / +0.018; SNR_domain +38.6 / +83.5 rather than +4 / +11; domain-probe P(target)
+0.001 -> 0.107 rather than unmoved; ||dz||/||z0|| 0.437; Delta_trans SNR 34.8 with
+leave-one-out direction cosine 0.999. The residual really is a large, highly consistent,
+content-preserving domain transport, which is the opposite of what this file reported.
+
+--- original docstring below ---
+
+Delta_k pre-check v3 -- targets DA-BRF's ACTUAL operand and fixes 'toward target'.
 
 Measures three DISTINCT residuals (v2 never measured the first one):
    Delta_trans   = F(U1) - F(x0)          <- the residual DA-BRF would repair

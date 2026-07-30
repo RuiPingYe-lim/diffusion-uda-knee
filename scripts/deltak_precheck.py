@@ -1,7 +1,25 @@
 #!/usr/bin/env python
-"""SUPERSEDED by deltak_precheck_v2.py -- kept only for provenance. DO NOT cite its numbers.
+"""RETRACTED -- kept only for provenance. DO NOT cite any number produced by this file.
+Superseded by scripts/v7_corrected.py (single-step operand) and scripts/v8_path_corrected.py
+(multi-step path).
 
-Two methodological errors were found in this version:
+FATAL DATA ERROR, shared by deltak_precheck{,_v2,_v3}.py, v6_retrained_probe.py and
+dcheck.py: x0 is read from ``cache/fusion_train_busi.csv:before_png``, which does NOT hold
+the source image. That column points at ``results_u2b_rev/.../fake_5/``, i.e. the BUSI image
+ALREADY TRANSLATED five bridge steps toward BrEaST -- the manifest is a cycle-audit table
+whose ``fake_*`` columns are the cycled-BACK images. Every "U1 = G(x0)" measured here is
+therefore a SECOND translation pass applied to an already-translated image, exactly the
+regime in which a further pass adds little. Verify a column by its pixel statistics, never
+by its name: the true source rendering is ``da_route/da_manifest.csv:raw`` (256px, mean
+64.52 / std 55.70, matching the raw PNG's 64.50 / 55.81), while ``before_png`` measures
+55.87 / 34.93.
+
+Conclusions drawn from this family and since RETRACTED: "translation covers only 2-3% of the
+domain gap" (it covers 19-32%), "the domain probe does not move at all" (P(target) rises
+0.001 -> 0.107), "U1 is a perturbation orthogonal to the domain axis", and the downgrade of
+the residual-repair idea to mere perturbation repair.
+
+Two further methodological errors specific to this earliest version:
   1. `noise_floor` is the CUMULATIVE divergence between two trajectories up to step k,
      compared against a SINGLE-step increment. The baseline therefore grows with k and
      the ratio is guaranteed to fall below 1 for later steps -- it cannot show that those

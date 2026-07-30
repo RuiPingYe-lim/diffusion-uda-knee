@@ -1,11 +1,21 @@
-"""Provenance check: is the frozen source classifier valid on the UNSB rendering?
+"""RETRACTED ATTRIBUTION -- kept for provenance. Superseded by section A of
+scripts/v7_corrected.py.
 
-Result: it is NOT. The gate classifier scores raw BUSI (`busi_train.csv:image_path`,
-128x128) at acc 0.984, but the UNSB input rendering (`fusion_train_busi.csv:before_png`,
-256x256) at acc 0.578 -- malignant 27/32 wrong, though AUC stays 0.916. Since U1 =
-G(before_png) lives in that same rendering, the frozen classifier cannot validly probe
-translated images: margins measured that way are the known "erosion = style sensitivity"
-artefact. Use a probe retrained on the translated rendering instead (v6_retrained_probe.py).
+This file compared the frozen gate classifier on raw BUSI (`busi_train.csv:image_path`,
+128px, acc 0.984) against `fusion_train_busi.csv:before_png` (256px, acc 0.578) and
+concluded the classifier is out of distribution "on the 256px UNSB rendering". That
+attribution is WRONG, because `before_png` is not a rendering of the source at all: it
+points at `results_u2b_rev/.../fake_5/`, i.e. an image already translated five bridge steps
+toward BrEaST. The comparison therefore confounded resolution with translation.
+
+With the proper control (`da_route/da_manifest.csv:raw`, the genuine 256px source
+rendering), v7 shows resolution has NO effect whatsoever -- raw 128px and raw 256px both
+score AUC 0.9996 / acc 0.9844 -- while translated images give U1 AUC 0.9517 / acc 0.5938 and
+U5 AUC 0.8992 / acc 0.5156. Ranking survives translation; threshold behaviour does not. The
+frozen teacher's problem is a LOGIT/CALIBRATION SHIFT on translated images, not lost
+information. A margin-based constraint is precisely sensitive to that shift, which is why a
+teacher trained across renderings is still required -- but for this reason, not the one
+stated below.
 """
 import numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as F, os
 from PIL import Image
