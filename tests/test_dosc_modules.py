@@ -19,6 +19,7 @@ if torch is not None:
         CalibrationInvariantDiagnosticPreservation,
         DiagnosticOrthogonalConditioner,
         DiagnosticSubspaceProjector,
+        TargetReferenceStyleConditioner,
         diagnostic_non_degradation_loss,
         gradient_reverse,
     )
@@ -64,6 +65,7 @@ class DiagnosticOrthogonalModuleTests(unittest.TestCase):
             num_classes=2,
             encoder_widths=(4, 8),
             queue_size=8,
+            enable_projection=True,
         )
         source = torch.randn(2, 3, 16, 16)
         target = torch.randn(2, 3, 16, 16)
@@ -86,6 +88,24 @@ class DiagnosticOrthogonalModuleTests(unittest.TestCase):
         ]
         self.assertTrue(gradients)
         self.assertTrue(all(torch.isfinite(gradient).all() for gradient in gradients))
+
+    def test_target_reference_conditioner_disables_projection_by_default(self):
+        conditioner = TargetReferenceStyleConditioner(
+            input_channels=3,
+            style_dim=8,
+            generator_style_dim=16,
+            num_classes=2,
+            encoder_widths=(4, 8),
+            queue_size=8,
+        )
+        source = torch.randn(2, 3, 16, 16)
+        target = torch.randn(2, 3, 16, 16)
+        labels = torch.tensor([0, 1])
+        context = conditioner.build_context(source, target, labels)
+
+        self.assertFalse(conditioner.enable_projection)
+        self.assertEqual(int(conditioner.projector.basis_rank.item()), 0)
+        self.assertEqual(float(context["removed_energy"]), 0.0)
 
     def test_margin_loss_penalizes_diagnostic_degradation(self):
         class MeanTeacher(nn.Module):

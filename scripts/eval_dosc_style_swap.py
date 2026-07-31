@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test whether DOSC reference-code leakage causally changes diagnosis.
+"""Test whether target-reference code leakage causally changes diagnosis.
 
 For each held-out labeled source case, the script generates translations under
 K different unlabeled target-train references while reusing the same bridge
@@ -100,7 +100,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epoch", default="latest")
     parser.add_argument("--teacher", type=Path, required=True)
     parser.add_argument("--out_dir", type=Path, required=True)
-    parser.add_argument("--tag", default="dosc")
+    parser.add_argument("--tag", default="trsc")
 
     parser.add_argument("--probe_manifest", type=Path, required=True)
     parser.add_argument("--probe_splits", default="src_train")
@@ -149,7 +149,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_nc", type=int, default=3)
     parser.add_argument("--dosc_style_dim", type=int, default=128)
     parser.add_argument("--dosc_encoder_widths", default="32,64,128,256")
-    parser.add_argument("--dosc_disable_projection", action="store_true")
+    projection = parser.add_mutually_exclusive_group()
+    projection.add_argument(
+        "--dosc_enable_projection",
+        action="store_true",
+        help="Evaluate the legacy projection ablation",
+    )
+    projection.add_argument(
+        "--dosc_disable_projection",
+        action="store_true",
+        help="Deprecated compatibility flag; projection is already disabled by default",
+    )
     parser.add_argument("--no_antialias", action="store_true")
     parser.add_argument("--no_antialias_up", action="store_true")
     return parser.parse_args()
@@ -366,9 +376,9 @@ def load_upstream_model(args: argparse.Namespace) -> LoadedModel:
         "--checkpoints_dir",
         str(args.checkpoints_dir.expanduser().resolve()),
         "--model",
-        "dosc_sb",
+        "trsc_sb",
         "--dataset_mode",
-        "dosc_unaligned",
+        "trsc_unaligned",
         "--direction",
         "AtoB",
         "--phase",
@@ -405,7 +415,9 @@ def load_upstream_model(args: argparse.Namespace) -> LoadedModel:
         "--serial_batches",
         "--eval",
     ]
-    if args.dosc_disable_projection:
+    if args.dosc_enable_projection:
+        option_args.append("--dosc_enable_projection")
+    elif args.dosc_disable_projection:
         option_args.append("--dosc_disable_projection")
     if args.no_antialias:
         option_args.append("--no_antialias")

@@ -21,25 +21,27 @@ image-to-image translation method).
 |---|---|
 | `eval_unsb_translation.py` | classify UNSB translation-only outputs (fake_1/3/5) with the source classifier; compare to direct transfer |
 | `build_unsb_fusion_csv.py` | build fusion-classifier CSVs (before + fake_1/3/5) from UNSB outputs |
-| `dosc_modules.py` | diagnostic subspace projection, adversarial/domain heads, target-reference style encoder |
+| `dosc_modules.py` | target-reference style encoder, CIDP, and legacy projection/GRL ablations |
 | `dosc_sb_model.py` | upstream UNSB model overlay using target exemplar conditions instead of random style noise |
 | `dosc_unaligned_dataset.py` | strict source-labeled / target-unlabeled dataset overlay |
+| `trsc_sb_model.py` | canonical model alias for new runs (`--model trsc_sb`) |
+| `trsc_unaligned_dataset.py` | canonical dataset alias for new runs |
 | `style_swap_metrics.py` | validated common-noise reference-swap and fixed-reference noise-control statistics |
-| `DOSC.md` | design, installation, training protocol, and required ablations |
+| `TRSC.md` | design, causal evidence boundary, training, and downstream attribution protocol |
+| `DOSC.md` | compatibility note for the retired method name |
 
 The cross-attention fusion classifier itself is `../bbdm_strict/fusion_classifier.py`.
 End-to-end driver scripts are in `../../scripts/run_unsb_fusion.sh` and `run_unsb_final.sh`.
 
-## Diagnostic-orthogonal source → target augmentation
+## Target-reference source → target augmentation
 
-The DOSC path reverses the old target→source inference direction: it translates labeled source
+The TRSC path reverses the old target→source inference direction: it translates labeled source
 images toward target style so the translated images can augment classifier training. It extracts a
 style code from an unlabeled target reference and injects it through UNSB's existing style-modulated
-residual blocks. Projection and GRL were designed to remove diagnostic information, but held-out
-linear probes currently do not show a reduction relative to the unprotected descriptor. They remain
-explicit ablations rather than a proven property. Output-level safety is measured by CIDP and the
-common-noise reference-swap audit in `scripts/eval_dosc_style_swap.py`. See [DOSC.md](DOSC.md) for
-the exact evidence boundary, losses, and commands.
+residual blocks. Projection and GRL did not reduce held-out diagnostic leakage and are disabled by
+default. A common-noise reference-swap audit found no significant reference-driven change in output
+diagnosis, so no swap-consistency loss is added. Output-level preservation is monitored by CIDP.
+See [TRSC.md](TRSC.md) for the exact evidence boundary, losses, and commands.
 
 ## Workflow
 

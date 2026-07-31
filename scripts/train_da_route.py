@@ -24,9 +24,9 @@ No target label, and no target image, is involved. Using both views is what make
 the rule arm-neutral: selecting on a single view leaves "which view is the
 validation set" as a second uncontrolled factor that differs across arms.
 
-The target set is scored EVERY epoch and written to a sealed directory, but never
-read during training and never used for any choice. The locked 51-case BrEaST
-test is not referenced anywhere in this file.
+The target set is scored EVERY epoch and written to a sealed directory without
+loading target labels. Target labels are joined only by the separate reporting
+script after every pre-registered run is complete.
 
 No weights are saved: 13 arms x seeds x ResNet50 would not fit the disk. Per-epoch
 per-sample probabilities (a few tens of KB per run) are saved instead, which lets
@@ -39,6 +39,7 @@ import hashlib
 import json
 import os
 import random
+import re
 from pathlib import Path
 
 import numpy as np
@@ -52,7 +53,16 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import models, transforms as T
 
 SIZE = 256
-ARMS = {"A0": "raw", "P1": "P1", "F1": "F1", "U1": "U1", "P5": "P5", "F5": "F5", "U5": "U5"}
+ARMS = {
+    "A0": "raw",
+    "P1": "P1",
+    "F1": "F1",
+    "U1": "U1",
+    "P5": "P5",
+    "F5": "F5",
+    "U5": "U5",
+}
+VALID_RUN_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def build_post(znorm=False):
@@ -69,10 +79,15 @@ def build_post(znorm=False):
     before any learned FiLM variant: on the knee dataset per-case normalisation
     erased the domain gap entirely.
     """
-    base = [T.ToTensor(), T.Lambda(lambda t: t.repeat(3, 1, 1) if t.shape[0] == 1 else t)]
+    base = [
+        T.ToTensor(),
+        T.Lambda(lambda t: t.repeat(3, 1, 1) if t.shape[0] == 1 else t),
+    ]
     if znorm:
-        return T.Compose(base + [T.Lambda(lambda t: (t - t.mean()) / (t.std() + 1e-6))])
-    return T.Compose(base + [T.Normalize([0.5]*3, [0.5]*3)])
+        return T.Compose(
+            base + [T.Lambda(lambda t: (t - t.mean()) / (t.std() + 1e-6))]
+        )
+    return T.Compose(base + [T.Normalize([0.5] * 3, [0.5] * 3)])
 
 
 def sha256_file(p):
@@ -92,7 +107,15 @@ class TwoViewDataset(Dataset):
     has to undo a flip/rotation and stops measuring appearance invariance.
     """
 
-    def __init__(self, df, cond_col, resize=224, train=False, aug_seed=0, znorm=False):
+    def __init__(
+        self,
+        df,
+        cond_col,
+        resize=224,
+        train=False,
+        aug_seed=0,
+        znorm=False,
+    ):
         self.df = df.reset_index(drop=True)
         self.cond = cond_col
         self.train = train
@@ -105,7 +128,8 @@ class TwoViewDataset(Dataset):
 
     def _load(self, p, flip, ang):
         im = Image.open(p).convert("L")
-        if im.size != (SIZE, SIZE):           # every arm through the same resampling path
+        if im.size != (SIZE, SIZE):
+            # Every arm must use the same resampling path.
             im = im.resize((SIZE, SIZE), Image.BICUBIC)
         if flip:
             im = im.transpose(Image.FLIP_LEFT_RIGHT)
@@ -116,9 +140,13 @@ class TwoViewDataset(Dataset):
     def __getitem__(self, i):
         r = self.df.iloc[i]
         flip = self.train and (self.rng_aug.random() < 0.5)
-        ang = (self.rng_aug.uniform(-10, 10) if self.train else 0.0)
-        return (self._load(r["raw"], flip, ang), self._load(r[self.cond], flip, ang),
-                int(r["label"]), str(r["case_id"]))
+        ang = self.rng_aug.uniform(-10, 10) if self.train else 0.0
+        return (
+            self._load(r["raw"], flip, ang),
+            self._load(r[self.cond], flip, ang),
+            int(r["label"]),
+            str(r["case_id"]),
+        )
 
 
 class EvalDataset(Dataset):
@@ -134,7 +162,32 @@ class EvalDataset(Dataset):
         im = Image.open(self.p[i]).convert("L")
         if im.size != (SIZE, SIZE):
             im = im.resize((SIZE, SIZE), Image.BICUBIC)
-        return self.post(im.resize((self.resize, self.resize), Image.BILINEAR)), int(self.y[i]), str(self.c[i])
+        return (
+            self.post(im.resize((self.resize, self.resize), Image.BILINEAR)),
+            int(self.y[i]),
+            str(self.c[i]),
+        )
+
+
+class UnlabeledEvalDataset(Dataset):
+    """Load target images and identifiers without materializing target labels."""
+
+    def __init__(self, paths, cases, resize=224, znorm=False):
+        self.p, self.c = list(paths), list(cases)
+        self.post = build_post(znorm)
+        self.resize = resize
+
+    def __len__(self):
+        return len(self.p)
+
+    def __getitem__(self, i):
+        im = Image.open(self.p[i]).convert("L")
+        if im.size != (SIZE, SIZE):
+            im = im.resize((SIZE, SIZE), Image.BICUBIC)
+        return (
+            self.post(im.resize((self.resize, self.resize), Image.BILINEAR)),
+            str(self.c[i]),
+        )
 
 
 def make_model(seed, device):
@@ -157,23 +210,63 @@ def predict(model, loader, dev):
     ps, ys, cs = [], [], []
     for x, y, c in loader:
         p = F.softmax(model(x.to(dev)), dim=1)[:, 1]
-        ps.append(p.cpu().numpy()); ys.append(np.asarray(y)); cs += list(c)
+        ps.append(p.cpu().numpy())
+        ys.append(np.asarray(y))
+        cs += list(c)
     return np.concatenate(ps), np.concatenate(ys), cs
+
+
+@torch.no_grad()
+def predict_unlabeled(model, loader, dev):
+    model.eval()
+    probabilities, cases = [], []
+    for image, case in loader:
+        probability = F.softmax(model(image.to(dev)), dim=1)[:, 1]
+        probabilities.append(probability.cpu().numpy())
+        cases += list(case)
+    return np.concatenate(probabilities), cases
 
 
 def case_auc(prob, y, case):
     d = pd.DataFrame({"case_id": case, "label": y, "p": prob})
-    g = d.groupby("case_id", sort=False).agg(label=("label", "first"), p=("p", "mean"))
+    g = d.groupby("case_id", sort=False).agg(
+        label=("label", "first"),
+        p=("p", "mean"),
+    )
     return float(roc_auc_score(g.label.values, g.p.values))
 
 
 def main():
     ap = argparse.ArgumentParser("matched DA-route training")
-    ap.add_argument("--arm", required=True, choices=list(ARMS))
-    ap.add_argument("--consistency", action="store_true", help="the `+C` variant (lambda_c > 0)")
-    ap.add_argument("--manifest", default="/root/autodl-tmp/breast/da_route/da_manifest.csv")
-    ap.add_argument("--target_csv", default="/root/autodl-tmp/breast/cache/fusion_eval_breast_diag.csv")
-    ap.add_argument("--src_test_csv", default="/root/autodl-tmp/breast/cache/busi_test.csv")
+    condition = ap.add_mutually_exclusive_group(required=True)
+    condition.add_argument("--arm", choices=list(ARMS))
+    condition.add_argument(
+        "--cond_col",
+        help="Arbitrary translated-view column in the manifest",
+    )
+    ap.add_argument(
+        "--run_name",
+        help="Stable arm name for generic --cond_col runs; defaults to the column name",
+    )
+    ap.add_argument(
+        "--consistency",
+        action="store_true",
+        help="the `+C` variant (lambda_c > 0)",
+    )
+    ap.add_argument(
+        "--manifest",
+        default="/root/autodl-tmp/breast/da_route/da_manifest.csv",
+    )
+    ap.add_argument(
+        "--target_csv",
+        default="/root/autodl-tmp/breast/cache/fusion_eval_breast_diag.csv",
+    )
+    ap.add_argument("--target_path_col", default="before_png")
+    ap.add_argument("--target_case_col", default="case_id")
+    ap.add_argument(
+        "--src_test_csv",
+        default="/root/autodl-tmp/breast/cache/busi_test.csv",
+    )
     ap.add_argument("--out_dir", default="/root/autodl-tmp/breast/da_route/runs")
     ap.add_argument("--sealed_dir", default="/root/autodl-tmp/breast/da_route/sealed")
     ap.add_argument("--epochs", type=int, default=50)
@@ -181,44 +274,120 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--lambda_a", type=float, default=1.0)
     ap.add_argument("--lambda_c", type=float, default=1.0)
-    ap.add_argument("--znorm", action="store_true",
-                    help="per-image z-score instead of the fixed Normalize(0.5,0.5); removes the "
-                         "global brightness/contrast gap by construction (the 3-line version of ④)")
+    ap.add_argument(
+        "--znorm",
+        action="store_true",
+        help=(
+            "per-image z-score instead of fixed Normalize(0.5,0.5); removes "
+            "the global brightness/contrast gap by construction"
+        ),
+    )
     ap.add_argument("--seed", type=int, default=42)
     a = ap.parse_args()
 
     lam_c = a.lambda_c if a.consistency else 0.0
-    name = f"{a.arm}{'C' if a.consistency else ''}{'Z' if a.znorm else ''}_s{a.seed}"
+    cond = a.cond_col or ARMS[a.arm]
+    arm_name = a.run_name or (a.arm if a.arm is not None else cond)
+    if not arm_name or not VALID_RUN_NAME.fullmatch(arm_name):
+        raise ValueError("run_name must contain only letters, digits, underscores, or hyphens")
+    name = (
+        f"{arm_name}{'C' if a.consistency else ''}"
+        f"{'Z' if a.znorm else ''}_s{a.seed}"
+    )
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     run = Path(a.out_dir) / name
     run.mkdir(parents=True, exist_ok=True)
     Path(a.sealed_dir).mkdir(parents=True, exist_ok=True)
 
     df = pd.read_csv(a.manifest)
+    required_manifest = {"case_id", "label", "split", "raw", cond}
+    missing_manifest = sorted(required_manifest - set(df.columns))
+    if missing_manifest:
+        raise ValueError(f"manifest is missing columns: {missing_manifest}")
     tr_df, va_df = df[df.split == "src_train"], df[df.split == "src_valid"]
-    cond = ARMS[a.arm]
+    if tr_df.empty or va_df.empty:
+        raise ValueError("manifest must contain non-empty src_train and src_valid")
+    if set(tr_df.case_id.astype(str)) & set(va_df.case_id.astype(str)):
+        raise ValueError("source train/valid case overlap")
 
-    # three independent streams; init and order identical across arms for a given seed
-    np.random.seed(a.seed); random.seed(a.seed)
-    model = make_model(a.seed, dev)                                   # rng_init
-    tr = DataLoader(TwoViewDataset(tr_df, cond, train=True, aug_seed=a.seed + 90000, znorm=a.znorm),
-                    batch_size=a.batch_size, shuffle=True, num_workers=4, drop_last=False,
-                    generator=torch.Generator().manual_seed(a.seed + 50000))           # rng_order
+    # Keep initialization, order, and augmentation RNG streams independent.
+    np.random.seed(a.seed)
+    random.seed(a.seed)
+    model = make_model(a.seed, dev)
+    tr = DataLoader(
+        TwoViewDataset(
+            tr_df,
+            cond,
+            train=True,
+            aug_seed=a.seed + 90000,
+            znorm=a.znorm,
+        ),
+        batch_size=a.batch_size,
+        shuffle=True,
+        num_workers=4,
+        drop_last=False,
+        generator=torch.Generator().manual_seed(a.seed + 50000),
+    )
 
     Z = a.znorm
-    va_raw = DataLoader(EvalDataset(va_df["raw"], va_df.label, va_df.case_id, znorm=Z), batch_size=32, num_workers=4)
-    va_cond = DataLoader(EvalDataset(va_df[cond], va_df.label, va_df.case_id, znorm=Z), batch_size=32, num_workers=4)
-    tgt = pd.read_csv(a.target_csv)
-    tg = DataLoader(EvalDataset(tgt["before_png"], tgt.label, tgt.case_id, znorm=Z), batch_size=32, num_workers=4)
+    va_raw = DataLoader(
+        EvalDataset(va_df["raw"], va_df.label, va_df.case_id, znorm=Z),
+        batch_size=32,
+        num_workers=4,
+    )
+    va_cond = DataLoader(
+        EvalDataset(va_df[cond], va_df.label, va_df.case_id, znorm=Z),
+        batch_size=32,
+        num_workers=4,
+    )
+    target_header = pd.read_csv(a.target_csv, nrows=0)
+    target_columns = {a.target_path_col, a.target_case_col}
+    missing_target = sorted(target_columns - set(target_header.columns))
+    if missing_target:
+        raise ValueError(f"target CSV is missing columns: {missing_target}")
+    # Intentionally exclude any target label column from the read.
+    tgt = pd.read_csv(a.target_csv, usecols=[a.target_path_col, a.target_case_col])
+    if tgt[a.target_case_col].astype(str).duplicated().any():
+        raise ValueError("target CSV contains duplicate case identifiers")
+    tg = DataLoader(
+        UnlabeledEvalDataset(
+            tgt[a.target_path_col],
+            tgt[a.target_case_col],
+            znorm=Z,
+        ),
+        batch_size=32,
+        num_workers=4,
+    )
     ste = pd.read_csv(a.src_test_csv)
-    st = DataLoader(EvalDataset(ste.image_path, ste.label, range(len(ste)), znorm=Z), batch_size=32, num_workers=4)
+    st = DataLoader(
+        EvalDataset(ste.image_path, ste.label, range(len(ste)), znorm=Z),
+        batch_size=32,
+        num_workers=4,
+    )
 
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
-    cfg = {"arm": a.arm, "consistency": bool(a.consistency), "lambda_a": a.lambda_a, "lambda_c": lam_c,
-           "cond_col": cond, "znorm": bool(a.znorm), "seed": a.seed, "epochs": a.epochs, "batch_size": a.batch_size, "lr": a.lr,
-           "selection_rule": "0.5*AUC(src_val,raw) + 0.5*AUC(src_val,cond)",
-           "manifest_sha256": sha256_file(a.manifest), "target_csv_sha256": sha256_file(a.target_csv),
-           "n_train": len(tr_df), "n_valid": len(va_df), "n_target": len(tgt)}
+    cfg = {
+        "arm": arm_name,
+        "legacy_arm": a.arm,
+        "consistency": bool(a.consistency),
+        "lambda_a": a.lambda_a,
+        "lambda_c": lam_c,
+        "cond_col": cond,
+        "znorm": bool(a.znorm),
+        "seed": a.seed,
+        "epochs": a.epochs,
+        "batch_size": a.batch_size,
+        "lr": a.lr,
+        "selection_rule": "0.5*AUC(src_val,raw) + 0.5*AUC(src_val,cond)",
+        "manifest_sha256": sha256_file(a.manifest),
+        "target_csv_sha256": sha256_file(a.target_csv),
+        "target_labels_used": False,
+        "target_path_col": a.target_path_col,
+        "target_case_col": a.target_case_col,
+        "n_train": len(tr_df),
+        "n_valid": len(va_df),
+        "n_target": len(tgt),
+    }
 
     hist, tgt_rows = [], []
     for ep in range(1, a.epochs + 1):
@@ -230,23 +399,38 @@ def main():
             o1, o2 = model(v1), model(v2)
             loss = F.cross_entropy(o1, y) + a.lambda_a * F.cross_entropy(o2, y)
             if lam_c > 0:
-                loss = loss + lam_c * F.mse_loss(F.softmax(o1, 1), F.softmax(o2, 1))
-            loss.backward(); opt.step()
+                loss = loss + lam_c * F.mse_loss(
+                    F.softmax(o1, 1),
+                    F.softmax(o2, 1),
+                )
+            loss.backward()
+            opt.step()
             tot += float(loss) * len(y)
 
         pr, yr, cr = predict(model, va_raw, dev)
         pc, yc, cc = predict(model, va_cond, dev)
         a_raw, a_cond = case_auc(pr, yr, cr), case_auc(pc, yc, cc)
-        score = 0.5 * a_raw + 0.5 * a_cond                       # THE selection score
-        pt, yt, ct = predict(model, tg, dev)                     # sealed: never read here
+        score = 0.5 * a_raw + 0.5 * a_cond
+        pt, ct = predict_unlabeled(model, tg, dev)
         ps, ys, cs = predict(model, st, dev)
-        hist.append({"epoch": ep, "loss": tot / len(tr_df), "val_raw_auc": a_raw,
-                     "val_cond_auc": a_cond, "select_score": score,
-                     "src_test_auc": case_auc(ps, ys, cs), "target_auc_SEALED": case_auc(pt, yt, ct)})
-        for cid, lb, p in zip(ct, yt, pt):
-            tgt_rows.append({"epoch": ep, "case_id": cid, "label": int(lb), "prob": float(p)})
-        print(f"epoch {ep:3d} loss {tot/len(tr_df):.4f}  val_raw {a_raw:.4f}  val_cond {a_cond:.4f}  "
-              f"score {score:.4f}", flush=True)
+        hist.append(
+            {
+                "epoch": ep,
+                "loss": tot / len(tr_df),
+                "val_raw_auc": a_raw,
+                "val_cond_auc": a_cond,
+                "select_score": score,
+                "src_test_auc": case_auc(ps, ys, cs),
+            }
+        )
+        for cid, p in zip(ct, pt):
+            tgt_rows.append({"epoch": ep, "case_id": cid, "prob": float(p)})
+        print(
+            f"epoch {ep:3d} loss {tot/len(tr_df):.4f}  "
+            f"val_raw {a_raw:.4f}  val_cond {a_cond:.4f}  "
+            f"score {score:.4f}",
+            flush=True,
+        )
 
     h = pd.DataFrame(hist)
     best = int(h.loc[h.select_score.idxmax(), "epoch"])

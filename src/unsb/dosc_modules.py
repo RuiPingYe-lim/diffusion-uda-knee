@@ -1,7 +1,12 @@
-"""Diagnostic-orthogonal target-style conditioning modules for UNSB.
+"""Target-reference style conditioning and output-safety modules for UNSB.
 
 This file is intentionally self-contained so it can be copied into the upstream
 UNSB ``models`` package by ``scripts/install_dosc_unsb_overlay.py``.
+
+The historical ``dosc`` module and option prefixes are retained for checkpoint
+and command compatibility. The experiments do not establish diagnostic
+orthogonality: projection and gradient reversal are optional ablations, while
+CIDP audits output-level diagnostic preservation.
 """
 
 from __future__ import annotations
@@ -226,8 +231,8 @@ class ReferenceStyleQueue(nn.Module):
         return self.queue[:count]
 
 
-class DiagnosticOrthogonalConditioner(nn.Module):
-    """Build target-reference style codes with diagnosis leakage suppression."""
+class TargetReferenceStyleConditioner(nn.Module):
+    """Build target-reference style codes with optional leakage-control ablations."""
 
     def __init__(
         self,
@@ -240,7 +245,7 @@ class DiagnosticOrthogonalConditioner(nn.Module):
         grl_strength: float = 1.0,
         queue_size: int = 128,
         contrastive_temperature: float = 0.07,
-        enable_projection: bool = True,
+        enable_projection: bool = False,
     ) -> None:
         super().__init__()
         self.style_dim = int(style_dim)
@@ -414,6 +419,11 @@ class DiagnosticOrthogonalConditioner(nn.Module):
         if warmup_steps <= 0:
             return 1.0
         return min(float(self.training_step.item()) / float(warmup_steps), 1.0)
+
+
+# Backward-compatible import name for existing overlays and external scripts.
+# It must not be used as a claim that the representation is diagnostic-orthogonal.
+DiagnosticOrthogonalConditioner = TargetReferenceStyleConditioner
 
 
 def true_class_margin(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:

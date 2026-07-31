@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install the DOSC model and dataset beside an existing upstream UNSB checkout."""
+"""Install the TRSC model and legacy-compatible aliases into upstream UNSB."""
 
 from __future__ import annotations
 
@@ -16,6 +16,8 @@ OVERLAY_FILES = {
     OVERLAY_ROOT / "dosc_modules.py": Path("models/dosc_modules.py"),
     OVERLAY_ROOT / "dosc_sb_model.py": Path("models/dosc_sb_model.py"),
     OVERLAY_ROOT / "dosc_unaligned_dataset.py": Path("data/dosc_unaligned_dataset.py"),
+    OVERLAY_ROOT / "trsc_sb_model.py": Path("models/trsc_sb_model.py"),
+    OVERLAY_ROOT / "trsc_unaligned_dataset.py": Path("data/trsc_unaligned_dataset.py"),
 }
 
 

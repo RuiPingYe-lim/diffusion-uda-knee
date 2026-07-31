@@ -1,7 +1,12 @@
-"""UNSB model overlay with diagnostic-orthogonal style conditioning.
+"""UNSB model overlay with target-reference style conditioning.
 
 Copy this file and ``dosc_modules.py`` into the upstream UNSB ``models``
-directory, then train with ``--model dosc_sb``.
+directory. New runs use the canonical ``--model trsc_sb`` alias; the historical
+``--model dosc_sb`` entry remains loadable.
+
+``dosc`` is retained as a compatibility prefix. Projection and diagnostic GRL
+are disabled by default because the frozen-probe and causal-swap audits do not
+support diagnostic-orthogonality claims.
 """
 
 from __future__ import annotations
@@ -13,7 +18,7 @@ import torch
 
 from .dosc_modules import (
     CalibrationInvariantDiagnosticPreservation,
-    DiagnosticOrthogonalConditioner,
+    TargetReferenceStyleConditioner,
     diagnostic_non_degradation_loss,
     parse_widths,
 )
@@ -21,7 +26,7 @@ from .sb_model import SBModel
 
 
 class DoscSBModel(SBModel):
-    """Replace UNSB random style noise with diagnosis-safe target exemplars."""
+    """Replace UNSB random style noise with target-reference conditions."""
 
     @staticmethod
     def modify_commandline_options(parser, is_train=True):
@@ -30,6 +35,14 @@ class DoscSBModel(SBModel):
         parser.add_argument("--dosc_num_classes", type=int, default=2)
         parser.add_argument("--dosc_encoder_widths", type=str, default="32,64,128,256")
         parser.add_argument("--dosc_projector_momentum", type=float, default=0.95)
+        parser.add_argument(
+            "--dosc_enable_projection",
+            action="store_true",
+            help=(
+                "Enable the legacy class-centroid projection as an ablation. "
+                "It is disabled by default because it did not reduce held-out leakage."
+            ),
+        )
         parser.add_argument("--dosc_disable_projection", action="store_true")
         parser.add_argument("--dosc_grl_strength", type=float, default=1.0)
         parser.add_argument("--dosc_queue_size", type=int, default=128)
@@ -41,7 +54,15 @@ class DoscSBModel(SBModel):
             help="Residual Gaussian fraction mixed into the target-reference condition",
         )
         parser.add_argument("--dosc_style_lr", type=float, default=-1.0)
-        parser.add_argument("--lambda_DOSC_diag", type=float, default=0.10)
+        parser.add_argument(
+            "--lambda_DOSC_diag",
+            type=float,
+            default=0.0,
+            help=(
+                "Legacy diagnostic-GRL ablation weight. The evidence-backed "
+                "target-reference default is zero."
+            ),
+        )
         parser.add_argument("--lambda_DOSC_domain", type=float, default=0.10)
         parser.add_argument("--lambda_DOSC_instance", type=float, default=0.10)
         parser.add_argument("--lambda_DOSC_recon", type=float, default=1.00)
@@ -77,7 +98,8 @@ class DoscSBModel(SBModel):
     def __init__(self, opt):
         if opt.direction != "AtoB":
             raise ValueError(
-                "DoscSBModel requires AtoB: domain A is labeled source and domain B is unlabeled target"
+                "DoscSBModel requires AtoB: domain A is labeled source and "
+                "domain B is unlabeled target"
             )
         if len(opt.gpu_ids) > 1:
             raise ValueError(
@@ -88,6 +110,10 @@ class DoscSBModel(SBModel):
             raise ValueError("DoscSBModel requires num_timesteps >= 2")
         if not 0.0 <= float(opt.dosc_noise_ratio) <= 1.0:
             raise ValueError("dosc_noise_ratio must be in [0, 1]")
+        if bool(opt.dosc_enable_projection) and bool(opt.dosc_disable_projection):
+            raise ValueError(
+                "dosc_enable_projection and dosc_disable_projection are mutually exclusive"
+            )
         if (
             bool(opt.isTrain)
             and float(opt.lambda_DOSC_safe) > 0.0
@@ -101,7 +127,7 @@ class DoscSBModel(SBModel):
             raise ValueError("dosc_cidp_rank_tolerance must be non-negative")
 
         super().__init__(opt)
-        self.netS = DiagnosticOrthogonalConditioner(
+        self.netS = TargetReferenceStyleConditioner(
             input_channels=opt.output_nc,
             style_dim=opt.dosc_style_dim,
             generator_style_dim=4 * opt.ngf,
@@ -111,7 +137,10 @@ class DoscSBModel(SBModel):
             grl_strength=opt.dosc_grl_strength,
             queue_size=opt.dosc_queue_size,
             contrastive_temperature=opt.dosc_contrastive_temperature,
-            enable_projection=not opt.dosc_disable_projection,
+            enable_projection=(
+                bool(opt.dosc_enable_projection)
+                and not bool(opt.dosc_disable_projection)
+            ),
         ).to(self.device)
         self.model_names.append("S")
         self._dosc_context: dict[str, torch.Tensor] = {}
@@ -177,7 +206,7 @@ class DoscSBModel(SBModel):
             parameter.requires_grad_(False)
         return teacher
 
-    def _style_module(self) -> DiagnosticOrthogonalConditioner:
+    def _style_module(self) -> TargetReferenceStyleConditioner:
         return self.netS.module if hasattr(self.netS, "module") else self.netS
 
     def _cidp_module(self) -> CalibrationInvariantDiagnosticPreservation:
