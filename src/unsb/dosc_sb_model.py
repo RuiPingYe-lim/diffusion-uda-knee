@@ -11,9 +11,11 @@ support diagnostic-orthogonality claims.
 
 from __future__ import annotations
 
+import random
 from collections.abc import Sequence
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from .dosc_modules import (
@@ -31,6 +33,12 @@ class DoscSBModel(SBModel):
     @staticmethod
     def modify_commandline_options(parser, is_train=True):
         parser = SBModel.modify_commandline_options(parser, is_train=is_train)
+        parser.add_argument(
+            "--seed",
+            type=int,
+            default=7,
+            help="Seed accepted by the overlay because upstream UNSB does not define one",
+        )
         parser.add_argument("--dosc_style_dim", type=int, default=128)
         parser.add_argument("--dosc_num_classes", type=int, default=2)
         parser.add_argument("--dosc_encoder_widths", type=str, default="32,64,128,256")
@@ -66,7 +74,12 @@ class DoscSBModel(SBModel):
         parser.add_argument("--lambda_DOSC_domain", type=float, default=0.10)
         parser.add_argument("--lambda_DOSC_instance", type=float, default=0.10)
         parser.add_argument("--lambda_DOSC_recon", type=float, default=1.00)
-        parser.add_argument("--lambda_DOSC_safe", type=float, default=0.50)
+        parser.add_argument(
+            "--lambda_DOSC_safe",
+            type=float,
+            default=0.0,
+            help="CIDP ablation weight; disabled in the evidence-backed TRSC core",
+        )
         parser.add_argument(
             "--dosc_safe_mode",
             type=str,
@@ -96,6 +109,11 @@ class DoscSBModel(SBModel):
         return parser
 
     def __init__(self, opt):
+        random.seed(int(opt.seed))
+        np.random.seed(int(opt.seed))
+        torch.manual_seed(int(opt.seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(opt.seed))
         if opt.direction != "AtoB":
             raise ValueError(
                 "DoscSBModel requires AtoB: domain A is labeled source and "

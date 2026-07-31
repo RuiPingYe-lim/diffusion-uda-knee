@@ -17,6 +17,8 @@ OVERLAY_FILES = {
     OVERLAY_ROOT / "dosc_sb_model.py": Path("models/dosc_sb_model.py"),
     OVERLAY_ROOT / "dosc_unaligned_dataset.py": Path("data/dosc_unaligned_dataset.py"),
     OVERLAY_ROOT / "trsc_sb_model.py": Path("models/trsc_sb_model.py"),
+    OVERLAY_ROOT / "trsc_joint_modules.py": Path("models/trsc_joint_modules.py"),
+    OVERLAY_ROOT / "trsc_joint_sb_model.py": Path("models/trsc_joint_sb_model.py"),
     OVERLAY_ROOT / "trsc_unaligned_dataset.py": Path("data/trsc_unaligned_dataset.py"),
 }
 

@@ -25,7 +25,9 @@ image-to-image translation method).
 | `dosc_sb_model.py` | upstream UNSB model overlay using target exemplar conditions instead of random style noise |
 | `dosc_unaligned_dataset.py` | strict source-labeled / target-unlabeled dataset overlay |
 | `trsc_sb_model.py` | canonical model alias for new runs (`--model trsc_sb`) |
-| `trsc_unaligned_dataset.py` | canonical dataset alias for new runs |
+| `trsc_joint_sb_model.py` | warm-started end-to-end classifier + TRSC training on raw and \(K\) unfiltered U1 views |
+| `trsc_joint_modules.py` | exact source-classifier architecture, task-gradient routing, and K-invariant multi-view CE |
+| `trsc_unaligned_dataset.py` | strict source labels plus \(K\) unique unlabeled target references |
 | `style_swap_metrics.py` | validated common-noise reference-swap and fixed-reference noise-control statistics |
 | `TRSC.md` | design, causal evidence boundary, training, and downstream attribution protocol |
 | `DOSC.md` | compatibility note for the retired method name |
@@ -40,8 +42,11 @@ images toward target style so the translated images can augment classifier train
 style code from an unlabeled target reference and injects it through UNSB's existing style-modulated
 residual blocks. Projection and GRL did not reduce held-out diagnostic leakage and are disabled by
 default. A common-noise reference-swap audit found no significant reference-driven change in output
-diagnosis, so no swap-consistency loss is added. Output-level preservation is monitored by CIDP.
-See [TRSC.md](TRSC.md) for the exact evidence boundary, losses, and commands.
+diagnosis, and the completed three-arm downstream audit found no stable CIDP gain, so all three
+controls are ablations rather than defaults. The current experiment uses \(K=3\) unique target
+references, keeps every U1 candidate, warm-starts both translator and classifier, and sends the
+classification CE through the candidates into the translator. See [TRSC.md](TRSC.md) for the exact
+evidence boundary, losses, and commands.
 
 ## Workflow
 

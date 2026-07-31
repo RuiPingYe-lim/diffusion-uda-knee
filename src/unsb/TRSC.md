@@ -16,10 +16,10 @@ TRSC（Target-Reference Style Conditioning）把 UNSB 的随机风格噪声 \(z\
 - **目标参考风格条件化有效**：风格码保留强域信息，并显著提高类条件域覆盖；
 - **潜变量诊断正交性不成立**：投影与 GRL 未优于无保护描述子；
 - **未发现生成器因果使用泄漏改变诊断**：潜变量可解码没有传导为参考驱动的输出诊断变化；
-- **CIDP 保留为输出层安全约束**：它约束校准后 margin 与局部排序，但不证明潜变量无泄漏；
+- **CIDP 没有稳定下游收益**：它可作为输出层安全消融，但不再进入默认模型；
 - **不加入风格交换一致性损失**：当前没有需要修复的参考驱动诊断波动，额外约束只会增加忽略条件的风险。
 
-因此，默认方法是“目标参考条件化 + CIDP”，投影和 GRL 默认关闭并仅作为负结果消融。新命令使用 `scripts/eval_trsc_style_swap.py`；旧文件名仅为既有服务器命令兼容保留。
+因此，默认方法只保留 **TRSC core**；CIDP、投影和 GRL 均关闭并仅作为消融。新命令使用 `scripts/eval_trsc_style_swap.py`；旧文件名仅为既有服务器命令兼容保留。
 
 ## 1. 设计目标
 
@@ -51,16 +51,14 @@ z_j = A(s_j).
 ## 3. 完整目标函数
 
 \[
-\mathcal L_{\mathrm{TRSC}} =
+\mathcal L_{\mathrm{TRSC\text{-}core}} =
 \mathcal L_{\mathrm{UNSB}}
 +\lambda_{\mathrm{dom}}\mathcal L_{\mathrm{domain}}
 +\lambda_{\mathrm{ins}}\mathcal L_{\mathrm{instance}}
-+\lambda_{\mathrm{rec}}\mathcal L_{\mathrm{style\text{-}rec}}
-+\lambda_{\mathrm{safe}}\mathcal L_{\mathrm{CIDP}}.
++\lambda_{\mathrm{rec}}\mathcal L_{\mathrm{style\text{-}rec}}.
 \]
 
-仅在旧控制消融中加入
-\(\lambda_{\mathrm{diag}}\mathcal L_{\mathrm{diag\text{-}adv}}\) 和线性投影。
+CIDP、\(\lambda_{\mathrm{diag}}\mathcal L_{\mathrm{diag\text{-}adv}}\) 和线性投影仅在旧控制消融中加入。
 
 ### 3.1 为什么废弃绝对 margin
 
@@ -76,7 +74,7 @@ d(x)=z_1(x)-z_0(x),\qquad m_y(x)=(2y-1)d(x).
 \left[m_y(x^s)-m_y(G(x^s))-\delta\right]_+.
 \]
 
-独立 BUSI 测试表明，U1 同时存在校准漂移和局部排序损失。旧教师在 U1 上对良性和恶性的平均安全罚分别为 0.101 和 6.399，形成 63 倍类别不对称；更换渲染鲁棒教师后仍为 0.509 和 1.276。原因不是 256 像素渲染，而是绝对 margin 对诊断分数的整体平移和温度变化敏感。因此默认安全项改为 CIDP（Calibration-Invariant Diagnostic Preservation，校准不变诊断保持）。
+独立 BUSI 测试表明，U1 同时存在校准漂移和局部排序损失。旧教师在 U1 上对良性和恶性的平均安全罚分别为 0.101 和 6.399，形成 63 倍类别不对称；更换渲染鲁棒教师后仍为 0.509 和 1.276。原因不是 256 像素渲染，而是绝对 margin 对诊断分数的整体平移和温度变化敏感。因此历史 `safe05` 臂把安全项改为 CIDP（Calibration-Invariant Diagnostic Preservation，校准不变诊断保持）；完成下游审计后该项已降为消融。
 
 ### 3.2 停止梯度的正仿射校准
 
@@ -238,11 +236,11 @@ python scripts/export_diagnostic_teacher.py \
 ```bash
 export UNSB_ROOT=/root/autodl-tmp/UNSB
 export TRSC_DATA_ROOT=/root/autodl-tmp/UNSB/datasets/busi_to_breast_dosc
-export TRSC_TEACHER=/root/autodl-tmp/busi_teacher.ts
 bash scripts/run_unsb_trsc_breast.sh
 ```
 
-推荐先保持 `K=2–3` 个目标参考风格，不要直接扩到 8 个。当前脚本以确定性参考条件生成一个候选；多候选实验应改变 `testB` 的参考排列或参考簇，而不是把 `fake_1…fake_5` 解释为五种独立风格。
+该脚本用于预训练单参考 TRSC 翻译器。后续多候选联合训练使用同一源图对应的不同 `testB` 目标参考；不能把 `fake_1…fake_5` 当成五种独立风格，因为它们是同一桥路径的不同翻译深度。
+复现 CIDP 消融时才设置 `TRSC_TEACHER=/path/to/busi_teacher.ts LAMBDA_SAFE=0.5`。
 
 ## 9. 必做消融
 
@@ -250,10 +248,9 @@ bash scripts/run_unsb_trsc_breast.sh
 |---|---|---|
 | 原始 UNSB | `--model sb` | 随机 \(z\) 基线 |
 | 目标参考条件化（core） | 默认关闭投影，`lambda_DOSC_diag=0`、`lambda_DOSC_safe=0` | 真实目标风格条件化的净作用 |
-| TRSC + CIDP | 默认关闭投影，`lambda_DOSC_diag=0`、`lambda_DOSC_safe=0.5` | CIDP 的净作用 |
+| TRSC + CIDP | 默认关闭投影，`lambda_DOSC_diag=0`、`lambda_DOSC_safe=0.5` | 复现 CIDP 无稳定收益的消融 |
 | 旧泄漏控制 | `--dosc_enable_projection --lambda_DOSC_diag 0.1` | 复现投影 + GRL 的负结果 |
 | TRSC + 旧 margin | `--dosc_safe_mode legacy_margin` | 验证类别偏斜的旧约束是否阻碍域迁移 |
-| 原始 UNSB | `--model sb` | 随机 \(z\) 基线 |
 
 多候选方法必须保证每个源样本的总训练权重一致，避免把“更多训练步数”误判成选择或条件化收益。
 
@@ -378,3 +375,76 @@ python scripts/eval_trsc_downstream.py \
 - `cidp < core`：CIDP 约束本身阻碍有效迁移；
 - `legacy_controls < cidp`：投影/GRL 造成额外损失，应从主方法删除；
 - 教师安全指标稳定但目标 AUC 仍下降：教师只覆盖一种诊断表征，不能把它当作下游充分条件。
+
+三随机种子、201 例目标开发集的实测均值为：
+
+| 条件 | AUC 均值 | 相对 raw |
+|---|---:|---:|
+| raw | 0.7842 | — |
+| core U1 | 0.7858 | +0.0015 |
+| CIDP U1 | 0.7696 | −0.0147 |
+| legacy U1 | 0.7848 | +0.0005 |
+| core U5 | 0.7287 | −0.0555 |
+| CIDP U5 | 0.7343 | −0.0499 |
+| legacy U5 | 0.7479 | −0.0364 |
+
+三个 U1 臂相对 raw 的区间均跨零，因此只能说“未检测到稳定影响”，不能说已经证明等效或无害。三个臂的 U5 均低于 U1，说明真正稳定的风险来自翻译深度。新实验只使用 U1，不再投入 U5。
+
+## 13. K 个不筛选候选 + 双 warm start + 端到端任务梯度
+
+当前待验证的问题不是继续压制风格码，而是“同一病例的多个真实目标参考是否能提供有用的数据多样性”。对源病例 \(x_i^s,y_i^s\) 无放回抽取 \(K\) 个目标训练参考 \(r_{ik}^t\)，生成：
+
+\[
+u_{ik}=G\!\left(x_i^s,t=0,E_s(r_{ik}^t)\right),\qquad k=1,\ldots,K.
+\]
+
+所有 \(u_{ik}\) 都进入分类器，不按教师分数、风格距离或目标标签筛选。默认任务损失给原图组和候选组各一半总权重：
+
+\[
+\mathcal L_{\mathrm{task}}
+=\frac12\,\mathrm{CE}(C(x_i^s),y_i^s)
++\frac{1}{2K}\sum_{k=1}^{K}\mathrm{CE}(C(u_{ik}),y_i^s).
+\]
+
+因此从 \(K=1\) 增至 \(K=3\) 不会放大一个源病例的总权重。分类器始终收到完整梯度；候选分支传给 \(G\) 与 \(E_s\) 的梯度乘 `lambda_TRSC_task`。默认值 1.0 即完整端到端解冻，设为 0.0 则只切断分类 CE 的翻译器梯度，同时保留 TRSC/UNSB 原生训练损失。
+
+规范入口强制使用两个 warm start：
+
+- `TRSC_INIT_DIR`：已有 TRSC core 的 `G/F/D/E/S` 检查点，之后全部保持可训练；
+- `SOURCE_CLASSIFIER_CKPT`：源域 `custom_resnet50_space` 最优检查点，联合分类器使用完全相同的网络结构并严格加载。
+
+先更新官方 UNSB overlay：
+
+```bash
+python scripts/install_trsc_unsb_overlay.py \
+  --unsb_root /root/autodl-tmp/UNSB \
+  --force
+```
+
+单次规范实验：
+
+```bash
+export UNSB_ROOT=/root/autodl-tmp/UNSB
+export TRSC_DATA_ROOT=/root/autodl-tmp/UNSB/datasets/busi_to_breast_dosc
+export TRSC_INIT_DIR=/path/to/pretrained_trsc_core
+export SOURCE_CLASSIFIER_CKPT=/path/to/source_classifier/best_checkpoint.pt
+
+NUM_REFERENCES=3 \
+LAMBDA_TASK=1.0 \
+SEED=7 \
+bash scripts/run_unsb_trsc_joint_breast.sh
+```
+
+最小归因矩阵：
+
+```bash
+SEEDS="7 16 42" bash scripts/run_trsc_joint_matrix.sh
+```
+
+| 实验臂 | \(K\) | 分类 CE → 翻译器 | 直接回答 |
+|---|---:|---:|---|
+| `k1_joint` | 1 | 是 | 单参考端到端基线 |
+| `k3_no_task_gradient` | 3 | 否 | 三候选本身对分类器是否有用 |
+| `k3_joint` | 3 | 是 | 多样性与任务驱动翻译能否合并产生收益 |
+
+所有实验臂使用同一个源分类器和同一个 TRSC 检查点起步。主要比较为 `k3_joint − k1_joint`（多参考多样性）和 `k3_joint − k3_no_task_gradient`（任务梯度）。raw 仍使用原 source-only 检查点。目标训练参考只读取图像路径，不读取标签；目标评价 CSV 先由 `eval_trsc_joint_classifier.py` 生成无标签病例概率，再由独立评估器连接封存标签。

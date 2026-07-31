@@ -20,11 +20,10 @@ and diagnostic experiments that motivated the design.
    alternatives (moment matching, histogram matching).
 4. **Cross-attention fusion classifier** (`src/bbdm_strict/fusion_classifier.py`) — classify using the
    original image as query, cross-attending to translated / sampled views.
-5. **Target-reference style conditioning with output-safety audits** (`src/unsb/TRSC.md`) —
-   replace UNSB random style noise with an unlabeled target exemplar and enforce output-level
-   calibration-invariant margin/rank preservation (CIDP). The common-noise causal swap audit finds
-   no evidence that decodable reference diagnosis changes output diagnosis. Linear projection and
-   GRL are therefore disabled by default and retained only as negative-result ablations.
+5. **Target-reference style conditioning and joint downstream training** (`src/unsb/TRSC.md`) —
+   replace UNSB random style noise with unlabeled target exemplars, generate \(K\) unfiltered U1
+   views per labeled source image, and train the source-warm-started classifier and translator
+   end-to-end. Causal and downstream audits demote CIDP, linear projection, and GRL to ablations.
 
 ## Repository layout
 
@@ -64,6 +63,8 @@ src/
 └── unsb/                                 # integration with the external UNSB translator (see below)
     ├── eval_unsb_translation.py         # classify UNSB translation-only outputs
     ├── build_unsb_fusion_csv.py         # build fusion CSVs from UNSB outputs
+    ├── trsc_joint_sb_model.py            # raw + K unfiltered U1 joint training overlay
+    ├── trsc_joint_modules.py             # source-compatible classifier and multi-view CE
     ├── style_swap_metrics.py            # causal reference-swap statistics and protocol checks
     ├── TRSC.md                           # evidence boundary, training, and downstream attribution
     └── README.md
