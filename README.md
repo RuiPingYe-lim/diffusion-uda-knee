@@ -20,9 +20,11 @@ and diagnostic experiments that motivated the design.
    alternatives (moment matching, histogram matching).
 4. **Cross-attention fusion classifier** (`src/bbdm_strict/fusion_classifier.py`) — classify using the
    original image as query, cross-attending to translated / sampled views.
-5. **Diagnostic-orthogonal target-style conditioning** (`src/unsb/DOSC.md`) — replace UNSB random
-   style noise with an unlabeled target exemplar, remove the source diagnostic subspace, and enforce
-   target-domain retention plus calibration-invariant margin and rank non-degradation (CIDP).
+5. **Target-reference style conditioning with diagnostic-safety audits** (`src/unsb/DOSC.md`) —
+   replace UNSB random style noise with an unlabeled target exemplar and enforce output-level
+   calibration-invariant margin/rank preservation (CIDP). Linear projection and GRL remain candidate
+   leakage controls: frozen probes currently show that they do not establish diagnostic orthogonality,
+   so `eval_dosc_style_swap.py` tests whether the residual code is causally used by the generator.
 
 ## Repository layout
 
@@ -62,6 +64,7 @@ src/
 └── unsb/                                 # integration with the external UNSB translator (see below)
     ├── eval_unsb_translation.py         # classify UNSB translation-only outputs
     ├── build_unsb_fusion_csv.py         # build fusion CSVs from UNSB outputs
+    ├── style_swap_metrics.py            # causal reference-swap statistics and protocol checks
     └── README.md
 scripts/                                  # one-shot driver scripts (edit paths before use)
 ```

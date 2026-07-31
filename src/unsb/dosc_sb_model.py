@@ -6,6 +6,7 @@ directory, then train with ``--model dosc_sb``.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
 import torch
@@ -196,12 +197,16 @@ class DoscSBModel(SBModel):
                 raise KeyError("The second UNSB data stream must also provide A_label")
             self.real_A_label2 = input2["A_label"].to(self.device).long()
 
-    def _bridge_times(self) -> torch.Tensor:
+    def _bridge_times(
+        self,
+        reference: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        reference = self.real_A if reference is None else reference
         count = int(self.opt.num_timesteps)
         increments = torch.tensor(
             [0.0] + [1.0 / float(index + 1) for index in range(count - 1)],
-            dtype=self.real_A.dtype,
-            device=self.real_A.device,
+            dtype=reference.dtype,
+            device=reference.device,
         )
         times = torch.cumsum(increments, dim=0)
         times = times / times[-1]
@@ -218,6 +223,107 @@ class DoscSBModel(SBModel):
         return self._style_module().mix_with_noise(
             condition,
             noise_ratio=self.opt.dosc_noise_ratio,
+        )
+
+    def translate_with_condition(
+        self,
+        source_image: torch.Tensor,
+        condition: torch.Tensor,
+        path_noises: Sequence[torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Roll out every bridge step under an explicit generator condition.
+
+        ``path_noises`` contains one tensor for each stochastic transition
+        after step zero. A leading batch dimension of one is broadcast across
+        the source batch, which lets the style-swap audit use common random
+        numbers and isolate the effect of changing only the reference style.
+        """
+
+        if source_image.ndim != 4:
+            raise ValueError(
+                f"Expected source BCHW tensor, got {tuple(source_image.shape)}"
+            )
+        if condition.ndim != 2:
+            raise ValueError(f"Expected condition [B,D], got {tuple(condition.shape)}")
+        batch_size = source_image.shape[0]
+        if condition.shape[0] == 1 and batch_size > 1:
+            condition = condition.expand(batch_size, -1)
+        elif condition.shape[0] != batch_size:
+            raise ValueError(
+                "source and condition batch sizes must match or condition must "
+                f"have batch size one, got {batch_size} and {condition.shape[0]}"
+            )
+
+        transition_count = max(int(self.opt.num_timesteps) - 1, 0)
+        if path_noises is not None and len(path_noises) != transition_count:
+            raise ValueError(
+                f"Expected {transition_count} path-noise tensors, "
+                f"got {len(path_noises)}"
+            )
+
+        times = self._bridge_times(source_image)
+        self.times = times
+        state = source_image
+        next_state = state
+        tau = float(self.opt.tau)
+        outputs = []
+        for step in range(int(self.opt.num_timesteps)):
+            if step > 0:
+                delta = times[step] - times[step - 1]
+                denominator = times[-1] - times[step - 1]
+                interpolation = (delta / denominator).reshape(1, 1, 1, 1)
+                scale = (delta * (1.0 - delta / denominator)).reshape(1, 1, 1, 1)
+                if path_noises is None:
+                    noise = torch.randn_like(state)
+                else:
+                    noise = path_noises[step - 1].to(
+                        device=state.device,
+                        dtype=state.dtype,
+                    )
+                    if noise.ndim != 4:
+                        raise ValueError(
+                            f"Path noise at step {step} must be BCHW, "
+                            f"got {tuple(noise.shape)}"
+                        )
+                    if noise.shape[0] == 1 and batch_size > 1:
+                        noise = noise.expand(batch_size, -1, -1, -1)
+                    if noise.shape != state.shape:
+                        raise ValueError(
+                            f"Path noise at step {step} has shape "
+                            f"{tuple(noise.shape)}, expected {tuple(state.shape)}"
+                        )
+                state = (
+                    (1.0 - interpolation) * state
+                    + interpolation * next_state.detach()
+                    + (scale * tau).sqrt() * noise
+                )
+            batch_time = torch.full(
+                (batch_size,),
+                step,
+                dtype=torch.long,
+                device=source_image.device,
+            )
+            next_state = self.netG(
+                state,
+                batch_time,
+                self._condition_with_noise(condition),
+            )
+            outputs.append(next_state)
+        return tuple(outputs)
+
+    def translate_with_reference(
+        self,
+        source_image: torch.Tensor,
+        target_reference: torch.Tensor,
+        path_noises: Sequence[torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Translate a source batch under target-reference style conditions."""
+
+        condition = self._style_module().encode_condition(target_reference)
+        return self.translate_with_condition(
+            source_image,
+            condition,
+            path_noises=path_noises,
         )
 
     def _rollout_training_states(
@@ -361,35 +467,9 @@ class DoscSBModel(SBModel):
 
     def _forward_test(self) -> None:
         self.real = self.real_A
-        times = self._bridge_times()
-        self.times = times
-        condition = self._style_module().encode_condition(self.real_B)
-        state = self.real_A
-        next_state = state
-        tau = float(self.opt.tau)
-        for step in range(int(self.opt.num_timesteps)):
-            if step > 0:
-                delta = times[step] - times[step - 1]
-                denominator = times[-1] - times[step - 1]
-                interpolation = (delta / denominator).reshape(1, 1, 1, 1)
-                scale = (delta * (1.0 - delta / denominator)).reshape(1, 1, 1, 1)
-                state = (
-                    (1.0 - interpolation) * state
-                    + interpolation * next_state.detach()
-                    + (scale * tau).sqrt() * torch.randn_like(state)
-                )
-            batch_time = torch.full(
-                (self.real_A.shape[0],),
-                step,
-                dtype=torch.long,
-                device=self.real_A.device,
-            )
-            next_state = self.netG(
-                state,
-                batch_time,
-                self._condition_with_noise(condition),
-            )
-            setattr(self, f"fake_{step + 1}", next_state)
+        outputs = self.translate_with_reference(self.real_A, self.real_B)
+        for step, output in enumerate(outputs, start=1):
+            setattr(self, f"fake_{step}", output)
 
     def forward(self):
         if self.isTrain:

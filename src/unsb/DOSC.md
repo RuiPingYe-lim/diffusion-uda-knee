@@ -1,6 +1,26 @@
-# DOSC：诊断正交的目标风格条件化
+# DOSC：目标风格条件化与诊断安全审计
 
-DOSC（Diagnostic-Orthogonal Style Conditioning）把 UNSB 原来的随机风格噪声 \(z\) 改为由无标签目标参考图编码得到的条件码，并显式抑制其中可由源域标签识别的诊断信息。该模块用于 **BUSI（有标签源域）→ BrEaST（无标签目标域）** 的源图目标风格增强。
+DOSC 最初按 Diagnostic-Orthogonal Style Conditioning 设计：把 UNSB 的随机风格噪声 \(z\) 改为由无标签目标参考图编码得到的条件码，并尝试通过线性投影与梯度反转抑制其中可由源域标签识别的诊断信息。该模块用于 **BUSI（有标签源域）→ BrEaST（无标签目标域）** 的源图目标风格增强。
+
+## 0. 当前证据边界
+
+冻结线性探针的最新结果不支持“诊断正交已经实现”：
+
+| 训练设置 | 编码阶段 | 诊断 AUC | 域 AUC |
+|---|---|---:|---:|
+| `safe0` | 投影前 | 0.6351 | 0.9188 |
+| `safe0` | 投影后 | 0.6502 | 0.9169 |
+| `safe05` | 投影前 | 0.6611 | 0.9260 |
+| `safe05` | 投影后 | 0.6854 | 0.9290 |
+
+随机 AUC 基准为 0.5。域信息得到保留，但诊断信息仍可线性解码；投影后 AUC 没有下降，单方向投影与现有 GRL 因而不能写成有效的泄漏控制。当前严格结论是：
+
+- **目标参考风格条件化有效**：风格码保留强域信息，并显著提高类条件域覆盖；
+- **潜变量诊断正交性不成立**：投影与 GRL 暂未优于无保护描述子；
+- **有害因果泄漏尚未确定**：风格码可解码不等于生成器实际利用这部分信息改变诊断；
+- **CIDP 仍解决输出安全问题**：它约束校准后 margin 与局部排序，但不证明潜变量无泄漏。
+
+因此，代码保留投影与 GRL 作为可复现实验臂，不再把它们的效果写成既成事实。`scripts/eval_dosc_style_swap.py` 使用共同随机数进行目标参考交换，专门检验潜变量泄漏是否被生成器因果利用。
 
 ## 1. 设计目标
 
@@ -21,7 +41,7 @@ z_j = A(\widetilde{s}_j).
 
 二分类时，\(\mathcal D\) 就是两个源域类别风格中心之差所张成的一维子空间。多分类时最多删除 \(C-1\) 个方向。
 
-## 2. 为什么不只使用梯度反转
+## 2. 候选泄漏控制为何包含投影与梯度反转
 
 乳腺超声中的采集纹理和病灶纹理高度耦合，仅靠一个类别对抗器容易出现“对抗器暂时失效，但风格码仍泄漏诊断信息”的情况。DOSC 同时使用：
 
@@ -29,6 +49,8 @@ z_j = A(\widetilde{s}_j).
 2. **诊断对抗头**：通过 GRL 抑制投影后残留的非线性诊断信息；
 3. **域分类头**：要求投影后的编码仍能区分源域和目标域，避免把域信息一并剥除；
 4. **参考实例对比**：目标图与其水平翻转视图为正对，历史目标参考码为负样本，防止所有目标风格坍缩为一个常量。
+
+前两项是待验证的候选机制。在线对抗头准确率和投影删除能量都不能替代训练后冻结探针；只有当独立探针 AUC 相对无机制基线稳定下降、域 AUC 不降且下游效用保留时，才能称其为有效泄漏控制。
 
 ## 3. 完整目标函数
 
@@ -248,3 +270,52 @@ bash scripts/run_unsb_dosc_breast.sh
 - `DOSC_safe_rank` 反映阈值移动无法修复的成对排序损失；
 - `DOSC_safe_c0` 与 `DOSC_safe_c1` 不应再出现旧约束的数量级不对称；
 - 最终判定仍以同一患者划分下的目标 AUC、配对 bootstrap CI 和三个随机种子为准。
+
+## 11. 风格码交换因果检验
+
+冻结探针只能证明风格码中的诊断信息“可解码”，不能证明生成器使用了这部分信息。交换检验对每个固定源病例使用 \(K\) 个无标签目标训练参考，并在不同参考之间复用完全相同的 UNSB 桥噪声：
+
+\[
+u_{ij}=T\!\left(G(x_i^s,z_j^t;\epsilon_i)\right).
+\]
+
+其中 \(x_i^s\) 与路径噪声 \(\epsilon_i\) 固定，仅改变目标参考条件 \(z_j^t\)。另设“固定参考 + 独立路径噪声”对照，避免把随机采样波动误判为参考风格效应。
+
+```bash
+python scripts/eval_dosc_style_swap.py \
+  --unsb_root /root/autodl-tmp/UNSB \
+  --checkpoints_dir /root/autodl-tmp/UNSB/checkpoints \
+  --experiment_name busi_to_breast_dosc \
+  --epoch latest \
+  --teacher /root/autodl-tmp/busi_teacher.ts \
+  --probe_manifest /path/to/da_manifest.csv \
+  --probe_splits src_train \
+  --probe_path_col src_path \
+  --source_manifest /path/to/u2b_rev_srctest_manifest.csv \
+  --source_split src_test \
+  --source_images_root /path/to/results_u2b_srctest/u2b_rev_SB/test_latest/images \
+  --source_images_subdir real \
+  --target_manifest /path/to/breast_target_train.csv \
+  --target_path_col image_path \
+  --references 12 \
+  --steps 1,5 \
+  --out_dir /path/to/style_swap_audit
+```
+
+输出包括：
+
+- `style_swap_per_pair.csv`：病例—参考—深度级诊断分数和风格一致性；
+- `fixed_reference_noise_per_pair.csv`：固定参考的路径噪声对照；
+- `selected_target_references.csv`：参考选择与源标签探针给出的 malignancy-like 分数；
+- `style_swap_summary.json`：源测试诊断探针 AUC、独立域探针 AUC、病例内方差、翻转率、病例级斜率 bootstrap CI 和参考置换检验。
+
+脚本只用源训练标签拟合诊断探针；目标清单即使包含标签列也不会读取。真实目标参考从目标训练集抽取，目标验证/测试图不能进入该实验。
+
+判定顺序为：
+
+1. 若病例级斜率置信区间跨 0、参考置换检验不显著，且参考引起的诊断波动不高于路径噪声对照，则只能说明“潜变量可解码”，不能认定存在有害因果泄漏；
+2. 若 malignancy-like 参考分数稳定推动同一源病例的输出诊断分数，且效应超过路径噪声，则再实现风格交换一致性损失；
+3. 若输出诊断稳定但不同参考的输出风格也不变，则生成器可能忽略条件，不能把安全性归功于泄漏控制；
+4. 投影与 GRL 只有在独立探针、因果安全和下游效用三个闸门同时改善时才保留为主方法，否则降为消融或删除。
+
+此前 130 例 BUSI 测试集已经用于教师验收并影响 CIDP 设计，因此后续交换结果属于机制开发证据，不再是完全未触碰的最终确认集。正式论文若声称因果安全，仍需新的独立源安全集或外部数据验证。

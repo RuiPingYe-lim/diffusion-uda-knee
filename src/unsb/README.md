@@ -24,6 +24,7 @@ image-to-image translation method).
 | `dosc_modules.py` | diagnostic subspace projection, adversarial/domain heads, target-reference style encoder |
 | `dosc_sb_model.py` | upstream UNSB model overlay using target exemplar conditions instead of random style noise |
 | `dosc_unaligned_dataset.py` | strict source-labeled / target-unlabeled dataset overlay |
+| `style_swap_metrics.py` | validated common-noise reference-swap and fixed-reference noise-control statistics |
 | `DOSC.md` | design, installation, training protocol, and required ablations |
 
 The cross-attention fusion classifier itself is `../bbdm_strict/fusion_classifier.py`.
@@ -31,11 +32,14 @@ End-to-end driver scripts are in `../../scripts/run_unsb_fusion.sh` and `run_uns
 
 ## Diagnostic-orthogonal source → target augmentation
 
-The new DOSC path reverses the old target→source inference direction: it translates labeled source
+The DOSC path reverses the old target→source inference direction: it translates labeled source
 images toward target style so the translated images can augment classifier training. It extracts a
-style code from an unlabeled target reference, removes the source diagnostic subspace, preserves
-domain information with a domain head, and injects the resulting condition through UNSB's existing
-style-modulated residual blocks. See [DOSC.md](DOSC.md) for the exact loss and commands.
+style code from an unlabeled target reference and injects it through UNSB's existing style-modulated
+residual blocks. Projection and GRL were designed to remove diagnostic information, but held-out
+linear probes currently do not show a reduction relative to the unprotected descriptor. They remain
+explicit ablations rather than a proven property. Output-level safety is measured by CIDP and the
+common-noise reference-swap audit in `scripts/eval_dosc_style_swap.py`. See [DOSC.md](DOSC.md) for
+the exact evidence boundary, losses, and commands.
 
 ## Workflow
 

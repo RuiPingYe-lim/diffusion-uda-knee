@@ -41,7 +41,12 @@ class InstallDoscOverlayTests(unittest.TestCase):
             )
             self.assertTrue((unsb_root / "models" / "dosc_modules.py").is_file())
             self.assertTrue((unsb_root / "models" / "dosc_sb_model.py").is_file())
-            self.assertTrue((unsb_root / "data" / "dosc_unaligned_dataset.py").is_file())
+            self.assertTrue(
+                (unsb_root / "data" / "dosc_unaligned_dataset.py").is_file()
+            )
+            model_overlay = (unsb_root / "models" / "dosc_sb_model.py").read_text()
+            self.assertIn("def translate_with_condition(", model_overlay)
+            self.assertIn("def translate_with_reference(", model_overlay)
 
 
 if __name__ == "__main__":

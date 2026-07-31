@@ -5,6 +5,7 @@ numpy
 pandas
 pillow
 scipy
+scikit-learn
 matplotlib
 lpips
 tqdm
