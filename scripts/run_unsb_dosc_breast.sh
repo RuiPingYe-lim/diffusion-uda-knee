@@ -66,7 +66,6 @@ python "${UNSB_ROOT}/train.py" \
   --dosc_cidp_min_per_class "${CIDP_MIN_PER_CLASS}" \
   --dosc_cidp_rank_weight "${CIDP_RANK_WEIGHT}" \
   --dosc_cidp_rank_tolerance "${CIDP_RANK_TOLERANCE}" \
-  --mode sb \
   --lambda_SB 1.0 \
   --lambda_NCE 1.0 \
   --batch_size "${BATCH_SIZE}" \
@@ -86,7 +85,6 @@ python "${UNSB_ROOT}/test.py" \
   --direction AtoB \
   --dosc_style_dim "${STYLE_DIM}" \
   --dosc_noise_ratio 0.0 \
-  --mode sb \
   --phase test \
   --epoch latest \
   --eval \

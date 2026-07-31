@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Do not pass --mode here. The model's own options are registered only after the base
+# parser has read --model, so at that point argparse still prefix-matches --mode to
+# --model and silently rewrites "--model trsc_joint_sb" to "sb". The whole TRSC option
+# group then never registers and train.py aborts with "unrecognized arguments:
+# --trsc_num_references ...". --mode already defaults to sb.
 # Train the requested raw + K unfiltered U1 end-to-end TRSC baseline.
 set -euo pipefail
 
@@ -62,7 +67,6 @@ python "${UNSB_ROOT}/train.py" \
   --lambda_DOSC_instance 0.10 \
   --lambda_DOSC_recon 1.00 \
   --lambda_DOSC_safe 0.0 \
-  --mode sb \
   --lambda_GAN 1.0 \
   --lambda_SB 1.0 \
   --lambda_NCE 1.0 \
