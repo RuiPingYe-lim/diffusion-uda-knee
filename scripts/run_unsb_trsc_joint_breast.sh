@@ -14,6 +14,7 @@ set -euo pipefail
 
 SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-busi_to_breast_trsc_joint_k3}"
+MODEL_NAME="${MODEL_NAME:-trsc_joint_sb}"
 CHECKPOINTS_DIR="${CHECKPOINTS_DIR:-${UNSB_ROOT}/checkpoints}"
 GPU_IDS="${GPU_IDS:-0}"
 SEED="${SEED:-7}"
@@ -33,6 +34,19 @@ TARGET_PATH_COL="${TARGET_PATH_COL:-image_path}"
 TARGET_CASE_COL="${TARGET_CASE_COL:-case_id}"
 PREDICTIONS_OUT="${PREDICTIONS_OUT:-${CHECKPOINTS_DIR}/${EXPERIMENT_NAME}/target_predictions.csv}"
 
+DABRF_TEACHER="${DABRF_TEACHER:-}"
+DABRF_MODE="${DABRF_MODE:-learned}"
+DABRF_HIDDEN_CHANNELS="${DABRF_HIDDEN_CHANNELS:-32}"
+DABRF_FIXED_SCALE="${DABRF_FIXED_SCALE:-0.8}"
+DABRF_MAX_RADIUS_RATIO="${DABRF_MAX_RADIUS_RATIO:-1.0}"
+DABRF_GATE_FLOOR="${DABRF_GATE_FLOOR:-0.0}"
+DABRF_GATE_INIT="${DABRF_GATE_INIT:-0.95}"
+DABRF_LR="${DABRF_LR:-1e-4}"
+DABRF_PROGRESS_RETENTION="${DABRF_PROGRESS_RETENTION:-0.8}"
+LAMBDA_DABRF_DIAG="${LAMBDA_DABRF_DIAG:-1.0}"
+LAMBDA_DABRF_PROGRESS="${LAMBDA_DABRF_PROGRESS:-1.0}"
+LAMBDA_DABRF_RADIUS="${LAMBDA_DABRF_RADIUS:-1.0}"
+
 if ! [[ "${NUM_REFERENCES}" =~ ^[1-9][0-9]*$ ]]; then
   echo "NUM_REFERENCES must be a positive integer" >&2
   exit 2
@@ -40,6 +54,29 @@ fi
 if [[ "${VIEW_WEIGHTING}" != "equal_groups" && "${VIEW_WEIGHTING}" != "equal_views" ]]; then
   echo "VIEW_WEIGHTING must be equal_groups or equal_views" >&2
   exit 2
+fi
+if [[ "${MODEL_NAME}" != "trsc_joint_sb" && "${MODEL_NAME}" != "trsc_dabrf_joint_sb" ]]; then
+  echo "MODEL_NAME must be trsc_joint_sb or trsc_dabrf_joint_sb" >&2
+  exit 2
+fi
+
+model_args=()
+if [[ "${MODEL_NAME}" == "trsc_dabrf_joint_sb" ]]; then
+  : "${DABRF_TEACHER:?Set DABRF_TEACHER to the frozen render-robust TorchScript teacher}"
+  model_args=(
+    --dabrf_teacher_path "${DABRF_TEACHER}"
+    --dabrf_mode "${DABRF_MODE}"
+    --dabrf_hidden_channels "${DABRF_HIDDEN_CHANNELS}"
+    --dabrf_fixed_scale "${DABRF_FIXED_SCALE}"
+    --dabrf_max_radius_ratio "${DABRF_MAX_RADIUS_RATIO}"
+    --dabrf_gate_floor "${DABRF_GATE_FLOOR}"
+    --dabrf_gate_init "${DABRF_GATE_INIT}"
+    --dabrf_lr "${DABRF_LR}"
+    --dabrf_progress_retention "${DABRF_PROGRESS_RETENTION}"
+    --lambda_DABRF_diag "${LAMBDA_DABRF_DIAG}"
+    --lambda_DABRF_progress "${LAMBDA_DABRF_PROGRESS}"
+    --lambda_DABRF_radius "${LAMBDA_DABRF_RADIUS}"
+  )
 fi
 
 export PYTHONPATH="${UNSB_ROOT}:${PYTHONPATH:-}"
@@ -49,7 +86,7 @@ python "${UNSB_ROOT}/train.py" \
   --dataroot "${TRSC_DATA_ROOT}" \
   --name "${EXPERIMENT_NAME}" \
   --checkpoints_dir "${CHECKPOINTS_DIR}" \
-  --model trsc_joint_sb \
+  --model "${MODEL_NAME}" \
   --dataset_mode trsc_unaligned \
   --direction AtoB \
   --dosc_source_manifest "${TRSC_DATA_ROOT}/trainA_manifest.csv" \
@@ -61,6 +98,7 @@ python "${UNSB_ROOT}/train.py" \
   --trsc_translator_init_epoch "${TRSC_INIT_EPOCH}" \
   --trsc_classifier_lr "${CLASSIFIER_LR}" \
   --trsc_deterministic true \
+  "${model_args[@]}" \
   --dosc_noise_ratio 0.0 \
   --lambda_DOSC_diag 0.0 \
   --lambda_DOSC_domain 0.10 \

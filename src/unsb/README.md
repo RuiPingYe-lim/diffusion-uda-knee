@@ -27,9 +27,12 @@ image-to-image translation method).
 | `trsc_sb_model.py` | canonical model alias for new runs (`--model trsc_sb`) |
 | `trsc_joint_sb_model.py` | warm-started end-to-end classifier + TRSC training on raw and \(K\) unfiltered U1 views |
 | `trsc_joint_modules.py` | exact source-classifier architecture, task-gradient routing, and K-invariant multi-view CE |
+| `trsc_dabrf_joint_sb_model.py` | U1-only diagnosis-aware residual repair on the K-view joint baseline |
+| `dabrf_modules.py` | spatial residual gate, hard radius projection, and fixed target-style progress metric |
 | `trsc_unaligned_dataset.py` | strict source labels plus \(K\) unique unlabeled target references |
 | `style_swap_metrics.py` | validated common-noise reference-swap and fixed-reference noise-control statistics |
 | `TRSC.md` | design, causal evidence boundary, training, and downstream attribution protocol |
+| `DABRF.md` | DA-BRF formulation, gradient boundary, attribution matrix, and stop rule |
 | `DOSC.md` | compatibility note for the retired method name |
 
 The cross-attention fusion classifier itself is `../bbdm_strict/fusion_classifier.py`.
@@ -47,6 +50,12 @@ controls are ablations rather than defaults. The current experiment uses \(K=3\)
 references, keeps every U1 candidate, warm-starts both translator and classifier, and sends the
 classification CE through the candidates into the translator. See [TRSC.md](TRSC.md) for the exact
 evidence boundary, losses, and commands.
+
+DA-BRF is a new, unvalidated U1-only experiment layered on that K-view baseline. It learns to
+attenuate the existing source-to-U1 residual locally, while a detached constraint branch combines
+calibration-decoupled source diagnosis, target-reference style progress, and a hard residual-radius
+bound. It does not restore U3/U5, and it does not claim a gain before the identity/simple-scaling
+controls are run. See [DABRF.md](DABRF.md).
 
 ## Workflow
 

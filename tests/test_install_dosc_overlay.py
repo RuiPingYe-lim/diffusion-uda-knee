@@ -63,6 +63,16 @@ class InstallDoscOverlayTests(unittest.TestCase):
                 (unsb_root / "models" / "trsc_joint_sb_model.py").is_file()
             )
             self.assertTrue(
+                (unsb_root / "models" / "dabrf_modules.py").is_file()
+            )
+            self.assertTrue(
+                (
+                    unsb_root
+                    / "models"
+                    / "trsc_dabrf_joint_sb_model.py"
+                ).is_file()
+            )
+            self.assertTrue(
                 (unsb_root / "data" / "trsc_unaligned_dataset.py").is_file()
             )
             model_overlay = (unsb_root / "models" / "dosc_sb_model.py").read_text()
@@ -82,6 +92,11 @@ class InstallDoscOverlayTests(unittest.TestCase):
             self.assertIn("class TrscJointSBModel", joint_model)
             self.assertIn("def generate_u1_candidates(", joint_model)
             self.assertIn("self.optimizer_C.step()", joint_model)
+            dabrf_model = (
+                unsb_root / "models" / "trsc_dabrf_joint_sb_model.py"
+            ).read_text()
+            self.assertIn("class TrscDabrfJointSBModel", dabrf_model)
+            self.assertIn("self.optimizer_R.step()", dabrf_model)
             canonical_dataset = (
                 unsb_root / "data" / "trsc_unaligned_dataset.py"
             ).read_text()

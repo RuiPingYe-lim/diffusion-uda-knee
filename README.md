@@ -24,6 +24,10 @@ and diagnostic experiments that motivated the design.
    replace UNSB random style noise with unlabeled target exemplars, generate \(K\) unfiltered U1
    views per labeled source image, and train the source-warm-started classifier and translator
    end-to-end. Causal and downstream audits demote CIDP, linear projection, and GRL to ablations.
+6. **Diagnosis-aware U1 residual repair** (`src/unsb/DABRF.md`) — add a bounded spatial residual
+   gate after each K-view U1 candidate, with detached calibrated-diagnosis, target-style-progress,
+   and residual-radius constraints. This is an unvalidated attribution experiment, not a claimed
+   improvement; U3/U5 remain stopped.
 
 ## Repository layout
 
@@ -65,8 +69,11 @@ src/
     ├── build_unsb_fusion_csv.py         # build fusion CSVs from UNSB outputs
     ├── trsc_joint_sb_model.py            # raw + K unfiltered U1 joint training overlay
     ├── trsc_joint_modules.py             # source-compatible classifier and multi-view CE
+    ├── trsc_dabrf_joint_sb_model.py      # U1-only TRSC + DA-BRF joint training overlay
+    ├── dabrf_modules.py                  # residual repair and constraint utilities
     ├── style_swap_metrics.py            # causal reference-swap statistics and protocol checks
     ├── TRSC.md                           # evidence boundary, training, and downstream attribution
+    ├── DABRF.md                          # residual-repair design, matrix, and stop rule
     └── README.md
 scripts/                                  # one-shot driver scripts (edit paths before use)
 ```
