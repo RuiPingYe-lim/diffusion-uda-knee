@@ -36,6 +36,11 @@ referenced anywhere in this file.
 """
 from __future__ import annotations
 
+import os
+# Required by torch.use_deterministic_algorithms for CUDA >= 10.2, and only read when the
+# CUDA context is created, so it has to be set before torch is imported.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 import argparse
 import hashlib
 import json
@@ -276,6 +281,17 @@ def main():
 
     # three independent streams: init and batch order identical across arms for a seed
     torch.manual_seed(a.seed); np.random.seed(a.seed); random.seed(a.seed)
+
+    # Seeding the streams is not enough on GPU. cuDNN selects convolution algorithms by
+    # benchmarking, and several backward kernels accumulate non-deterministically, so this
+    # configuration at seed 42 returned 0.7778, 0.8147 and 0.7875 on three repeat runs -- a
+    # 0.037 spread, wider than any effect this protocol is built to detect, which made an
+    # ordinary re-run look like a systematic -0.021 regression against an older result.
+    # Pinning both makes one seed mean one trajectory, so the spread that remains across
+    # seeds is a real seed effect rather than kernel scheduling.
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
     model = AttnPoolNet(pool=a.pool).to(dev)
     tr = DataLoader(TwoViewDataset(tr_df, cond, train=True, aug_seed=a.seed + 90000),
                     batch_size=a.batch_size, shuffle=True, num_workers=4,
@@ -290,6 +306,9 @@ def main():
            "lambda_sup": a.lambda_sup, "temp": a.temp, "seed": a.seed, "epochs": a.epochs,
            "tail": a.tail, "batch_size": a.batch_size, "lr": a.lr,
            "selection_rule": f"fixed budget, predictions averaged over the last {a.tail} epochs",
+           "deterministic": {"cudnn_deterministic": True, "cudnn_benchmark": False,
+                             "use_deterministic_algorithms": True,
+                             "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG")},
            "manifest_sha256": sha256_file(a.manifest), "target_csv_sha256": sha256_file(a.target_csv),
            "n_train": len(tr_df), "n_valid": len(va_df), "n_target": int(tgt.case_id.nunique())}
 

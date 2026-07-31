@@ -38,6 +38,10 @@ import argparse
 import hashlib
 import json
 import os
+# Required by torch.use_deterministic_algorithms for CUDA >= 10.2, and only read when the
+# CUDA context is created, so it has to be set before torch is imported.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 import random
 import re
 from pathlib import Path
@@ -190,6 +194,21 @@ class UnlabeledEvalDataset(Dataset):
         )
 
 
+def pin_determinism():
+    """Make one seed mean one trajectory.
+
+    Seeding the RNG streams is not enough on GPU: cuDNN selects convolution algorithms by
+    benchmarking and several backward kernels accumulate non-deterministically. Measured on
+    this protocol, one config at one seed returned 0.7778, 0.8147 and 0.7875 across repeat
+    runs -- a 0.037 spread, wider than any effect the arms are meant to separate, which made
+    an ordinary re-run look like a systematic regression. With this pinned, the same seed
+    reproduces to ten decimal places and the spread across seeds is a real seed effect.
+    """
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
+
 def make_model(seed, device):
     """Weight init driven ONLY by rng_init, so it is bit-identical across arms."""
     g = torch.Generator().manual_seed(seed)
@@ -313,6 +332,7 @@ def main():
     # Keep initialization, order, and augmentation RNG streams independent.
     np.random.seed(a.seed)
     random.seed(a.seed)
+    pin_determinism()
     model = make_model(a.seed, dev)
     tr = DataLoader(
         TwoViewDataset(
@@ -379,6 +399,12 @@ def main():
         "batch_size": a.batch_size,
         "lr": a.lr,
         "selection_rule": "0.5*AUC(src_val,raw) + 0.5*AUC(src_val,cond)",
+        "deterministic": {
+            "cudnn_deterministic": True,
+            "cudnn_benchmark": False,
+            "use_deterministic_algorithms": True,
+            "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+        },
         "manifest_sha256": sha256_file(a.manifest),
         "target_csv_sha256": sha256_file(a.target_csv),
         "target_labels_used": False,
