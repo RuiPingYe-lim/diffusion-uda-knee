@@ -13,6 +13,12 @@ DA-BRF（Diagnosis-Aware Bridge Residual Repair）接在当前 TRSC 多参考联
 
 因此，DA-BRF 是待验证的新实验，不是已证实有效的方法。它与旧 CIDP 的关键区别是：CIDP 直接处罚生成器输出，而 DA-BRF 在 U1 已经生成后学习一个局部残差修复器，并让安全约束只更新修复器，避免生成器通过改变输出分布规避冻结教师。
 
+### 1.1 Identity 对照的协议修正
+
+早期实现让 `identity` 仍进入 DA-BRF 子类，虽然输出像素等于 U1，但每批仍会运行修复器、冻结教师、校准队列和零权重约束；同时，上游 UNSB 在构造过程中覆盖了 `cudnn.benchmark=False`。因此，旧 `dabrf_identity` 不是 K3 joint 的严格复现，其结果不得用于计算 DA-BRF 净增益。
+
+修正后的 `identity` 直接调用原始 `trsc_joint_sb` 入口，不构造 DA-BRF、教师、队列或额外优化器。确定性设置也在上游构造函数返回后重新应用。由于这一设置同时改变了修复后的 K3 基线运行环境，旧 K3 与旧 identity 都不能充当新协议的复现目标；必须用同一修复提交各重跑一次。新的 identity 与新 K3 通过复现检查前，不运行或解释其他 DA-BRF 实验臂。
+
 ## 2. 修复对象
 
 对源图 $x_i^s$ 和第 $k$ 张 U1 候选 $u_{ik}$，定义原始桥残差：
@@ -103,12 +109,14 @@ r_{ik}=u_{ik}-x_i^s.
 
 ## 4. 梯度边界
 
-训练中对同一批候选执行两条数值相同、反向边界不同的修复路径：
+完整约束臂对同一批候选执行两条数值相同、反向边界不同的修复路径：
 
 1. **任务路径**：分类 CE 完整更新分类器与 DA-BRF，并按 `lambda_TRSC_task` 将梯度传给 TRSC 生成器和风格编码器；
 2. **约束路径**：输入 U1 在进入 DA-BRF 前 `detach()`，诊断、风格进度和半径损失只更新 DA-BRF，不更新生成器。
 
 这一区分防止生成器和冻结教师/校准器形成共同降低安全损失的捷径。分类器仍使用原图与全部 K 张修复候选，`equal_groups` 保持每个源病例总权重不随 K 改变。
+
+`learned_task_only` 的三个约束权重均为 0，因此只执行任务路径，不加载诊断教师、不更新校准队列，也不执行第二次修复器前向。`fixed_scale08` 与 `norm_clip08` 只执行确定性的残差变换，不分配未使用的门控卷积参数。
 
 ## 5. 代码入口
 
@@ -127,19 +135,30 @@ python scripts/install_trsc_unsb_overlay.py \
   --force
 ```
 
-准备与现有 K3 联合实验相同的双 warm start，并提供冻结教师：
+准备与现有 K3 联合实验相同的双 warm start。先分别重跑新 K3 和新 identity；这一步不需要冻结教师：
 
 ```bash
 export UNSB_ROOT=/path/to/UNSB
 export TRSC_DATA_ROOT=/path/to/busi_to_breast_dosc
 export TRSC_INIT_DIR=/path/to/pretrained_trsc_core
 export SOURCE_CLASSIFIER_CKPT=/path/to/source_classifier/best_checkpoint.pt
+
+ARMS="k3_joint" SEEDS="7" bash scripts/run_trsc_joint_matrix.sh
+ARMS="identity" SEEDS="7" bash scripts/run_trsc_dabrf_matrix.sh
+```
+
+两个矩阵使用带 `detfix_v2` 的新默认实验前缀，不会复用旧 K3 或旧 identity 的 checkpoint 目录；不要手动把 `EXPERIMENT_PREFIX` 改回旧名称。
+
+只有新 identity 与相同 checkpoint、相同 seed 和相同训练参数下的 `k3_joint` 复现一致，才提供冻结教师并运行其余单种子实验：
+
+```bash
 export DABRF_TEACHER=/path/to/render_robust_teacher.ts
 
+ARMS="fixed_scale08 norm_clip08 learned_task_only learned_full" \
 SEEDS="7" bash scripts/run_trsc_dabrf_matrix.sh
 ```
 
-种子 7 的训练、日志和推理协议正常，且 `learned_full` 相对 `identity` 有明确正方向后，再运行：
+种子 7 的训练、日志和推理协议正常，且 `learned_full` 相对 `identity` 有明确正方向后，再运行完整三种子矩阵：
 
 ```bash
 SEEDS="7 16 42" bash scripts/run_trsc_dabrf_matrix.sh
@@ -149,7 +168,7 @@ SEEDS="7 16 42" bash scripts/run_trsc_dabrf_matrix.sh
 
 | 实验臂 | 作用 |
 |---|---|
-| `identity` | 通过同一新模型复现未修复 K3 joint 基线 |
+| `identity` | 直接运行原始 `trsc_joint_sb`，严格复现 K3 joint 基线 |
 | `fixed_scale08` | 检验统一把残差缩到 0.8 是否足够 |
 | `norm_clip08` | 检验仅限制每例残差范数是否足够 |
 | `learned_task_only` | 检验空间门控本身及源 CE 是否足够 |

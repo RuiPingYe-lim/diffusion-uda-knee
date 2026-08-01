@@ -74,10 +74,38 @@ class TrscDabrfJointSBModel(TrscJointSBModel):
 
     def __init__(self, opt):
         self._validate_dabrf_options(opt)
+        self._dabrf_enabled = str(opt.dabrf_mode) != "identity"
+        self._dabrf_diag_enabled = (
+            self._dabrf_enabled and float(opt.lambda_DABRF_diag) > 0.0
+        )
+        self._dabrf_progress_enabled = (
+            self._dabrf_enabled and float(opt.lambda_DABRF_progress) > 0.0
+        )
+        self._dabrf_radius_enabled = (
+            self._dabrf_enabled and float(opt.lambda_DABRF_radius) > 0.0
+        )
+        self._dabrf_constraints_enabled = any(
+            (
+                self._dabrf_diag_enabled,
+                self._dabrf_progress_enabled,
+                self._dabrf_radius_enabled,
+            )
+        )
         super().__init__(opt)
 
-        # Keep the identity arm on the historical K3 random stream. The new
-        # repair weights must not shift target-reference or bridge-noise draws.
+        self.task_repaired_candidates: torch.Tensor | None = None
+        self.constraint_repaired_candidates: torch.Tensor | None = None
+        self._dabrf_task_context: dict[str, torch.Tensor] = {}
+        self._dabrf_constraint_context: dict[str, torch.Tensor] = {}
+        self.netDABRFTeacher = None
+
+        # Identity is a true base-model bypass. It deliberately constructs no
+        # DA-BRF module, queue, teacher, optimizer, or additional CUDA state.
+        if not self._dabrf_enabled:
+            return
+
+        # Repair-weight initialization must not shift target-reference or
+        # bridge-noise draws in the substantive learned arms.
         cpu_rng_state = torch.random.get_rng_state()
         cuda_rng_states = (
             torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
@@ -96,46 +124,60 @@ class TrscDabrfJointSBModel(TrscJointSBModel):
             torch.random.set_rng_state(cpu_rng_state)
             if cuda_rng_states is not None:
                 torch.cuda.set_rng_state_all(cuda_rng_states)
-        self.netQ = CalibrationInvariantDiagnosticPreservation(
-            queue_size=opt.dabrf_queue_size,
-            min_per_class=opt.dabrf_min_per_class,
-            affine_ridge=opt.dabrf_affine_ridge,
-            min_scale=opt.dabrf_min_scale,
-            max_scale=opt.dabrf_max_scale,
-        ).to(self.device)
-        self.model_names.extend(["R", "Q"])
+        self.model_names.append("R")
 
-        self.netDABRFTeacher = None
+        if self._dabrf_diag_enabled:
+            self.netQ = CalibrationInvariantDiagnosticPreservation(
+                queue_size=opt.dabrf_queue_size,
+                min_per_class=opt.dabrf_min_per_class,
+                affine_ridge=opt.dabrf_affine_ridge,
+                min_scale=opt.dabrf_min_scale,
+                max_scale=opt.dabrf_max_scale,
+            ).to(self.device)
+            self.model_names.append("Q")
+
         if self.isTrain:
-            self.netDABRFTeacher = self._load_dabrf_teacher(opt.dabrf_teacher_path)
-            self.loss_names += [
-                "DABRF_total",
-                "DABRF_diag",
-                "DABRF_diag_margin",
-                "DABRF_diag_rank",
-                "DABRF_progress",
-                "DABRF_radius",
-                "DABRF_affine_scale",
-                "DABRF_affine_bias",
-                "DABRF_calibration_ready",
-                "DABRF_progress_retention",
-                "DABRF_progress_valid",
-                "DABRF_candidate_style_gain",
-                "DABRF_repaired_style_gain",
-                "DABRF_radius_ratio",
-                "DABRF_radius_max",
-                "DABRF_gate_mean",
-            ]
-            self.optimizer_R = torch.optim.AdamW(
-                self.netR.parameters(),
-                lr=float(opt.dabrf_lr),
-                weight_decay=float(opt.dabrf_weight_decay),
-            )
-            self.optimizers.append(self.optimizer_R)
+            self.loss_names += ["DABRF_total", "DABRF_gate_mean"]
+            if self._dabrf_diag_enabled:
+                self.netDABRFTeacher = self._load_dabrf_teacher(
+                    opt.dabrf_teacher_path
+                )
+                self.loss_names += [
+                    "DABRF_diag",
+                    "DABRF_diag_margin",
+                    "DABRF_diag_rank",
+                    "DABRF_affine_scale",
+                    "DABRF_affine_bias",
+                    "DABRF_calibration_ready",
+                ]
+            if self._dabrf_progress_enabled:
+                self.loss_names += [
+                    "DABRF_progress",
+                    "DABRF_progress_retention",
+                    "DABRF_progress_valid",
+                    "DABRF_candidate_style_gain",
+                    "DABRF_repaired_style_gain",
+                ]
+            if self._dabrf_radius_enabled:
+                self.loss_names += [
+                    "DABRF_radius",
+                    "DABRF_radius_ratio",
+                    "DABRF_radius_max",
+                ]
 
-        self.task_repaired_candidates: torch.Tensor | None = None
-        self.constraint_repaired_candidates: torch.Tensor | None = None
-        self._dabrf_constraint_context: dict[str, torch.Tensor] = {}
+            repair_parameters = [
+                parameter
+                for parameter in self.netR.parameters()
+                if parameter.requires_grad
+            ]
+            self.optimizer_R = None
+            if repair_parameters:
+                self.optimizer_R = torch.optim.AdamW(
+                    repair_parameters,
+                    lr=float(opt.dabrf_lr),
+                    weight_decay=float(opt.dabrf_weight_decay),
+                )
+                self.optimizers.append(self.optimizer_R)
 
     @staticmethod
     def _validate_dabrf_options(opt) -> None:
@@ -153,7 +195,27 @@ class TrscDabrfJointSBModel(TrscJointSBModel):
                 raise ValueError(f"{name} must be non-negative")
         if not 0.0 <= float(opt.dabrf_progress_retention) <= 1.0:
             raise ValueError("dabrf_progress_retention must be in [0, 1]")
-        if int(opt.dosc_num_classes) != 2:
+        has_constraints = any(
+            float(getattr(opt, name)) > 0.0
+            for name in (
+                "lambda_DABRF_diag",
+                "lambda_DABRF_progress",
+                "lambda_DABRF_radius",
+            )
+        )
+        if (
+            str(opt.dabrf_mode) not in ("identity", "learned")
+            and has_constraints
+        ):
+            raise ValueError(
+                "DA-BRF constraints require dabrf_mode=learned; fixed controls "
+                "must use zero constraint weights"
+            )
+        if (
+            str(opt.dabrf_mode) != "identity"
+            and float(opt.lambda_DABRF_diag) > 0.0
+            and int(opt.dosc_num_classes) != 2
+        ):
             raise ValueError("DA-BRF currently supports binary diagnosis only")
 
     def _load_dabrf_teacher(self, value: str):
@@ -173,6 +235,8 @@ class TrscDabrfJointSBModel(TrscJointSBModel):
         return teacher
 
     def _calibration_module(self) -> CalibrationInvariantDiagnosticPreservation:
+        if not self._dabrf_diag_enabled:
+            raise RuntimeError("DA-BRF diagnostic calibration is disabled")
         return self.netQ.module if hasattr(self.netQ, "module") else self.netQ
 
     def _flat_multi_reference_inputs(
@@ -198,6 +262,9 @@ class TrscDabrfJointSBModel(TrscJointSBModel):
         return source, references, batch_size, reference_count
 
     def forward(self):
+        if not self._dabrf_enabled:
+            return super().forward()
+
         super().forward()
         if not self.isTrain or self._data_dependent_initializing:
             return
@@ -215,6 +282,12 @@ class TrscDabrfJointSBModel(TrscJointSBModel):
         self.task_repaired_candidates = task_result["repaired"].reshape_as(
             self.task_candidates
         )
+        self._dabrf_task_context = task_result
+
+        if not self._dabrf_constraints_enabled:
+            self.constraint_repaired_candidates = None
+            self._dabrf_constraint_context = {}
+            return
 
         # The constraint branch trains R but cannot move G to game its teacher.
         constraint_result = self.netR(
@@ -230,6 +303,8 @@ class TrscDabrfJointSBModel(TrscJointSBModel):
         self._dabrf_constraint_context = constraint_result
 
     def _task_logits(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self._dabrf_enabled:
+            return super()._task_logits()
         if self.task_repaired_candidates is None:
             raise RuntimeError("DA-BRF task candidates are not initialized")
         batch_size, reference_count = self.task_repaired_candidates.shape[:2]
@@ -262,6 +337,8 @@ class TrscDabrfJointSBModel(TrscJointSBModel):
         batch_size: int,
         reference_count: int,
     ) -> dict[str, torch.Tensor]:
+        if not self._dabrf_diag_enabled:
+            raise RuntimeError("DA-BRF diagnostic constraint is disabled")
         if self.netDABRFTeacher is None:
             raise RuntimeError("DA-BRF diagnostic teacher is not initialized")
         with torch.no_grad():
@@ -295,11 +372,22 @@ class TrscDabrfJointSBModel(TrscJointSBModel):
         return result
 
     def compute_G_loss(self):
-        if self._data_dependent_initializing:
+        if not self._dabrf_enabled or self._data_dependent_initializing:
             return super().compute_G_loss()
         base_loss = super().compute_G_loss()
-        if self.task_candidates is None or self.constraint_repaired_candidates is None:
-            raise RuntimeError("DA-BRF candidates are not initialized")
+        if self.task_candidates is None:
+            raise RuntimeError("DA-BRF task candidates are not initialized")
+
+        self.loss_DABRF_gate_mean = self._dabrf_task_context[
+            "gate_mean"
+        ].detach()
+        zero = base_loss.new_zeros(())
+        self.loss_DABRF_total = zero
+        if not self._dabrf_constraints_enabled:
+            self.loss_G = base_loss
+            return self.loss_G
+        if self.constraint_repaired_candidates is None:
+            raise RuntimeError("DA-BRF constraint candidates are not initialized")
 
         source, references, batch_size, reference_count = (
             self._flat_multi_reference_inputs(self.task_candidates)
@@ -312,52 +400,63 @@ class TrscDabrfJointSBModel(TrscJointSBModel):
             batch_size * reference_count,
             *self.constraint_repaired_candidates.shape[2:],
         )
-        diagnostic = self._diagnostic_repair_loss(
-            repaired_flat,
-            batch_size,
-            reference_count,
-        )
-        progress = target_style_progress_loss(
-            source.detach(),
-            candidate_flat,
-            repaired_flat,
-            references.detach(),
-            minimum_retention=self.opt.dabrf_progress_retention,
-            minimum_gain=self.opt.dabrf_progress_min_gain,
-        )
-        radius = residual_radius_loss(
-            source.detach(),
-            candidate_flat,
-            repaired_flat,
-            max_ratio=self.opt.dabrf_max_radius_ratio,
-        )
 
-        self.loss_DABRF_diag = diagnostic["loss"]
-        self.loss_DABRF_diag_margin = diagnostic["margin_loss"]
-        self.loss_DABRF_diag_rank = diagnostic["rank_loss"]
-        self.loss_DABRF_progress = progress["loss"]
-        self.loss_DABRF_radius = radius["loss"]
-        self.loss_DABRF_affine_scale = diagnostic["affine_scale"]
-        self.loss_DABRF_affine_bias = diagnostic["affine_bias"]
-        self.loss_DABRF_calibration_ready = diagnostic["ready"]
-        self.loss_DABRF_progress_retention = progress["retention"]
-        self.loss_DABRF_progress_valid = progress["valid_fraction"]
-        self.loss_DABRF_candidate_style_gain = progress["candidate_gain"]
-        self.loss_DABRF_repaired_style_gain = progress["repaired_gain"]
-        self.loss_DABRF_radius_ratio = radius["ratio"]
-        self.loss_DABRF_radius_max = radius["maximum_ratio"]
-        self.loss_DABRF_gate_mean = self._dabrf_constraint_context[
-            "gate_mean"
-        ].detach()
-        self.loss_DABRF_total = (
-            float(self.opt.lambda_DABRF_diag) * self.loss_DABRF_diag
-            + float(self.opt.lambda_DABRF_progress) * self.loss_DABRF_progress
-            + float(self.opt.lambda_DABRF_radius) * self.loss_DABRF_radius
-        )
+        if self._dabrf_diag_enabled:
+            diagnostic = self._diagnostic_repair_loss(
+                repaired_flat,
+                batch_size,
+                reference_count,
+            )
+            self.loss_DABRF_diag = diagnostic["loss"]
+            self.loss_DABRF_diag_margin = diagnostic["margin_loss"]
+            self.loss_DABRF_diag_rank = diagnostic["rank_loss"]
+            self.loss_DABRF_affine_scale = diagnostic["affine_scale"]
+            self.loss_DABRF_affine_bias = diagnostic["affine_bias"]
+            self.loss_DABRF_calibration_ready = diagnostic["ready"]
+            self.loss_DABRF_total = self.loss_DABRF_total + (
+                float(self.opt.lambda_DABRF_diag) * self.loss_DABRF_diag
+            )
+
+        if self._dabrf_progress_enabled:
+            progress = target_style_progress_loss(
+                source.detach(),
+                candidate_flat,
+                repaired_flat,
+                references.detach(),
+                minimum_retention=self.opt.dabrf_progress_retention,
+                minimum_gain=self.opt.dabrf_progress_min_gain,
+            )
+            self.loss_DABRF_progress = progress["loss"]
+            self.loss_DABRF_progress_retention = progress["retention"]
+            self.loss_DABRF_progress_valid = progress["valid_fraction"]
+            self.loss_DABRF_candidate_style_gain = progress["candidate_gain"]
+            self.loss_DABRF_repaired_style_gain = progress["repaired_gain"]
+            self.loss_DABRF_total = self.loss_DABRF_total + (
+                float(self.opt.lambda_DABRF_progress)
+                * self.loss_DABRF_progress
+            )
+
+        if self._dabrf_radius_enabled:
+            radius = residual_radius_loss(
+                source.detach(),
+                candidate_flat,
+                repaired_flat,
+                max_ratio=self.opt.dabrf_max_radius_ratio,
+            )
+            self.loss_DABRF_radius = radius["loss"]
+            self.loss_DABRF_radius_ratio = radius["ratio"]
+            self.loss_DABRF_radius_max = radius["maximum_ratio"]
+            self.loss_DABRF_total = self.loss_DABRF_total + (
+                float(self.opt.lambda_DABRF_radius) * self.loss_DABRF_radius
+            )
+
         self.loss_G = base_loss + self.loss_DABRF_total
         return self.loss_G
 
     def optimize_parameters(self):
+        if not self._dabrf_enabled:
+            return super().optimize_parameters()
+
         self.netG.train()
         self.netE.train()
         self.netD.train()
@@ -365,7 +464,8 @@ class TrscDabrfJointSBModel(TrscJointSBModel):
         self.netS.train()
         self.netC.train()
         self.netR.train()
-        self.netQ.train()
+        if self._dabrf_diag_enabled:
+            self.netQ.train()
         if self.netP is not None:
             self.netP.train()
         if self.netDABRFTeacher is not None:
@@ -389,7 +489,8 @@ class TrscDabrfJointSBModel(TrscJointSBModel):
         self.optimizer_G.zero_grad()
         self.optimizer_S.zero_grad()
         self.optimizer_C.zero_grad()
-        self.optimizer_R.zero_grad()
+        if self.optimizer_R is not None:
+            self.optimizer_R.zero_grad()
         if self.opt.netF == "mlp_sample":
             self.optimizer_F.zero_grad()
         self.loss_G = self.compute_G_loss()
@@ -397,7 +498,8 @@ class TrscDabrfJointSBModel(TrscJointSBModel):
         self.optimizer_G.step()
         self.optimizer_S.step()
         self.optimizer_C.step()
-        self.optimizer_R.step()
+        if self.optimizer_R is not None:
+            self.optimizer_R.step()
         if self.opt.netF == "mlp_sample":
             self.optimizer_F.step()
         self._style_module().advance_step()

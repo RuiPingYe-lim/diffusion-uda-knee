@@ -102,12 +102,17 @@ class TrscJointSBModel(DoscSBModel):
         if int(opt.trsc_classifier_input_size) < 32:
             raise ValueError("trsc_classifier_input_size must be at least 32")
 
+        super().__init__(opt)
+
+        # Upstream UNSB's BaseModel enables cuDNN benchmarking in its
+        # constructor. Re-apply the experiment protocol after every upstream
+        # constructor has returned so the requested setting cannot be
+        # silently overwritten.
         if bool(opt.trsc_deterministic):
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
             torch.use_deterministic_algorithms(True, warn_only=True)
 
-        super().__init__(opt)
         self.netC = SourceWarmStartResNet50(
             num_classes=opt.dosc_num_classes,
         ).to(self.device)

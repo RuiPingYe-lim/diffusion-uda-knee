@@ -24,6 +24,12 @@ class DABRFModuleTests(unittest.TestCase):
         self.assertTrue(torch.equal(result["repaired"], candidate))
         self.assertTrue(torch.equal(result["gate"], torch.ones_like(candidate)))
 
+    def test_nonlearned_controls_allocate_no_trainable_gate(self):
+        for mode in ("identity", "fixed_scale", "norm_clip"):
+            module = DiagnosisAwareBridgeResidualRepair(mode=mode)
+            self.assertIsNone(module.gate_network)
+            self.assertEqual(sum(p.numel() for p in module.parameters()), 0)
+
     def test_fixed_scale_is_an_exact_non_learned_control(self):
         source = torch.zeros(1, 3, 8, 8)
         candidate = torch.ones_like(source)

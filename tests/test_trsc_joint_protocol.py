@@ -67,6 +67,15 @@ class TrscJointProtocolTests(unittest.TestCase):
         self.assertIn("self.optimizer_S.step()", model)
         self.assertIn("self.optimizer_C.step()", model)
 
+    def test_determinism_is_reapplied_after_upstream_initialization(self):
+        model = MODEL.read_text(encoding="utf-8")
+        upstream_init = model.index("super().__init__(opt)")
+        benchmark_off = model.index("torch.backends.cudnn.benchmark = False")
+        self.assertLess(upstream_init, benchmark_off)
+        runner = RUNNER.read_text(encoding="utf-8")
+        self.assertIn("--trsc_deterministic true", runner)
+        self.assertIn('export PYTHONHASHSEED="${SEED}"', runner)
+
     def test_target_inference_reads_no_label_column(self):
         evaluator = EVALUATOR.read_text(encoding="utf-8")
         self.assertIn("usecols=[args.path_col, args.case_col]", evaluator)
@@ -90,6 +99,7 @@ class TrscJointProtocolTests(unittest.TestCase):
             matrix,
         )
         self.assertIn('run_arm "k3_joint" "${seed}" 3 1.0', matrix)
+        self.assertIn('ARMS="${ARMS:-k1_joint k3_no_task_gradient k3_joint}"', matrix)
         self.assertNotIn("CIDP", matrix)
         self.assertNotIn("topk", matrix.lower())
 

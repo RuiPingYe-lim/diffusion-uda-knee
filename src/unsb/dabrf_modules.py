@@ -105,26 +105,28 @@ class DiagnosisAwareBridgeResidualRepair(nn.Module):
         self.max_radius_ratio = float(max_radius_ratio)
         self.gate_floor = float(gate_floor)
 
-        hidden_channels = int(hidden_channels)
-        groups = _group_count(hidden_channels)
-        self.gate_network = nn.Sequential(
-            nn.Conv2d(3 * self.input_channels, hidden_channels, 3, padding=1),
-            nn.GroupNorm(groups, hidden_channels),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(hidden_channels, hidden_channels, 3, padding=1),
-            nn.GroupNorm(groups, hidden_channels),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(hidden_channels, self.input_channels, 1),
-        )
-        output_layer = self.gate_network[-1]
-        nn.init.zeros_(output_layer.weight)
-        normalized_init = (
-            (float(gate_init) - self.gate_floor) / (1.0 - self.gate_floor)
-        )
-        nn.init.constant_(
-            output_layer.bias,
-            math.log(normalized_init / (1.0 - normalized_init)),
-        )
+        self.gate_network: nn.Sequential | None = None
+        if self.mode == "learned":
+            hidden_channels = int(hidden_channels)
+            groups = _group_count(hidden_channels)
+            self.gate_network = nn.Sequential(
+                nn.Conv2d(3 * self.input_channels, hidden_channels, 3, padding=1),
+                nn.GroupNorm(groups, hidden_channels),
+                nn.SiLU(inplace=True),
+                nn.Conv2d(hidden_channels, hidden_channels, 3, padding=1),
+                nn.GroupNorm(groups, hidden_channels),
+                nn.SiLU(inplace=True),
+                nn.Conv2d(hidden_channels, self.input_channels, 1),
+            )
+            output_layer = self.gate_network[-1]
+            nn.init.zeros_(output_layer.weight)
+            normalized_init = (
+                (float(gate_init) - self.gate_floor) / (1.0 - self.gate_floor)
+            )
+            nn.init.constant_(
+                output_layer.bias,
+                math.log(normalized_init / (1.0 - normalized_init)),
+            )
 
     def forward(
         self,
@@ -165,6 +167,8 @@ class DiagnosisAwareBridgeResidualRepair(nn.Module):
             )
             gate = radius_scale[:, None, None, None].expand_as(raw_residual)
         else:
+            if self.gate_network is None:
+                raise RuntimeError("Learned DA-BRF mode requires a gate network")
             gate_logits = self.gate_network(
                 torch.cat([source, candidate, raw_residual], dim=1)
             )

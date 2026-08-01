@@ -62,7 +62,6 @@ fi
 
 model_args=()
 if [[ "${MODEL_NAME}" == "trsc_dabrf_joint_sb" ]]; then
-  : "${DABRF_TEACHER:?Set DABRF_TEACHER to the frozen render-robust TorchScript teacher}"
   model_args=(
     --dabrf_teacher_path "${DABRF_TEACHER}"
     --dabrf_mode "${DABRF_MODE}"
@@ -81,6 +80,7 @@ fi
 
 export PYTHONPATH="${UNSB_ROOT}:${PYTHONPATH:-}"
 export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
+export PYTHONHASHSEED="${SEED}"
 
 python "${UNSB_ROOT}/train.py" \
   --dataroot "${TRSC_DATA_ROOT}" \
