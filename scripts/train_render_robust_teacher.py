@@ -1,39 +1,47 @@
 #!/usr/bin/env python3
-"""Train a RENDER-ROBUST diagnostic teacher for the DOSC margin constraint.
+"""Train a render-robust diagnostic teacher for the DOSC CIDP constraint.
 
 WHY THIS EXISTS
 ---------------
-``dosc_modules.diagnostic_non_degradation_loss`` compares the true-class margin of the
-source image against that of the TRANSLATED image and penalises the drop. That is only a
-diagnostic-safety signal if the teacher can read both renderings equally well.
+The legacy DOSC loss compared the true-class margin of the source image with
+that of the translated image. That measurement is useful only when the teacher
+reads both renderings consistently.
 
-The teacher currently exported (``gate_busi2breast_cache/best_checkpoint.pt``) was trained
-on raw BUSI PNGs only. Measured on this repo's data:
+The v9 development diagnostic found that the 128px source PNG and its 256px
+source rendering score identically, ruling out resolution as the cause. It
+also found that threshold recalibration recovers only part of the U1 accuracy
+loss, indicating calibration drift plus local ranking loss. Those v9 values
+were measured on ``src_train`` and must not be quoted as held-out acceptance.
 
-    raw BUSI (image_path, 128x128)              acc 0.984
-    UNSB input rendering (before_png, 256x256)  acc 0.578   <-- 27/32 malignant wrong
+The authoritative 130-case BUSI source-test result, which neither teacher
+trained on, is:
 
-and, on translated images, a frozen source classifier loses 0.149 AUC while a probe
-retrained on that rendering loses only 0.023. The lesion survives translation; the frozen
-teacher simply cannot read it. Used as-is, the margin term therefore fires on APPEARANCE
-CHANGE rather than on diagnostic damage, i.e. it becomes a leash toward the identity
-mapping -- the exact degeneration DOSC is meant to avoid, and doubly harmful here because
-the translator already under-translates (~3% of the class-conditional domain gap).
+    rendering          old AUC/acc       render-robust AUC/acc
+    source             0.9386/0.9000          0.9367/0.9231
+    U1                 0.8747/0.7385          0.9242/0.8846
+    U5                 0.8017/0.7154          0.9207/0.8385
+
+That matters because the margin m_y = (2y-1)d is not calibration-invariant.
+The measured offset is b ~ -3.94, and the per-class margin change is +2.10 for
+benign but -7.75 for malignant. Since the legacy safety term only penalised
+drops, it read as "do not translate malignant cases". The new CIDP loss removes
+positive affine drift before measuring local margin and rank degradation. A
+render-robust teacher remains useful, but it is not a substitute for CIDP.
 
 WHAT THIS DOES
 --------------
-Fine-tunes the same architecture on a MIXTURE of renderings of the SAME source cases:
-raw PNG, the 256px generator-input rendering, and the precomputed translations. Every view
-of a case carries that case's SOURCE label, so no target label is ever touched and the UDA
-boundary is untouched -- target images are not read at all by this script.
+Fine-tunes the same architecture on a mixture of renderings of the same source
+cases: raw PNG, the 256px generator-input rendering, and UNSB translations.
+Every view carries its case's source label. Target-domain labels are never
+read. Target-train appearance is present only through the already-generated
+UNSB translations, which is allowed by the UDA protocol.
 
 ACCEPTANCE
 ----------
-The run prints AUC/accuracy PER RENDERING on the source validation split, next to the old
-checkpoint's numbers when ``--baseline_weights`` is given. The teacher is fit for purpose
-when its worst rendering is close to its best; a teacher that is excellent on raw and poor
-on translations is the failure this script exists to remove. Checkpoint selection uses the
-WORST-rendering AUC for that reason.
+Checkpoint selection uses only the disjoint source validation split and
+maximises its worst-rendering AUC. The held-out BUSI test split is evaluated
+later by ``scripts/v10_heldout.py`` and must never be supplied as either the
+training or validation split.
 """
 
 from __future__ import annotations
@@ -61,9 +69,13 @@ if str(SRC_ROOT) not in sys.path:
 
 from eval_existing_classifier_on_csv import build_model  # noqa: E402
 
-RAW_VIEW = "raw"
-SOURCE_RENDER_CANDIDATES = ("before_png", "source_png", "src_png")
-IMAGE_COL_CANDIDATES = ("image_path", "path", "img_path", "filepath")
+# da_manifest.csv columns, verified by pixel statistics rather than by name:
+#   src_path 128px raw (mean 64.50/std 55.81) | raw 256px source render (64.52/55.70)
+#   U1, U5   UNSB translations (51.87 / 55.87)
+# The cache/fusion_*_busi.csv manifests are NOT usable here: their `before_png` is itself a
+# translation (results_u2b_rev/.../fake_5/) and their fake_* columns point at a deleted
+# cycle-back directory.
+DEFAULT_VIEWS = "src_path,raw,U1,U5"
 
 
 def build_transform(resize: int) -> T.Compose:
@@ -78,92 +90,96 @@ def build_transform(resize: int) -> T.Compose:
     )
 
 
-def detect(frame: pd.DataFrame, candidates, required: bool = True):
-    lower = {c.lower(): c for c in frame.columns}
-    for name in candidates:
-        if name.lower() in lower:
-            return lower[name.lower()]
-    if required:
-        raise ValueError(f"none of {candidates} in columns {list(frame.columns)}")
-    return None
-
-
-def stem_of(path_value: str) -> str:
-    return Path(str(path_value)).stem
-
-
-def key_stem(key_value: str) -> str:
-    """'src_train__00000' -> '00000'; falls back to the whole key."""
-    text = str(key_value)
-    return text.rsplit("__", 1)[-1] if "__" in text else text
-
-
-def build_records(manifest_csv: Path, raw_csv: Path | None, max_fakes: int):
-    """One record per case: {label, views: {name -> path}}.
-
-    Views come from the manifest (256px source rendering + translations). The raw PNG is
-    joined in by filename stem when a raw CSV is given; a failed join degrades to
-    "manifest views only" with a warning rather than silently mismatching labels.
-    """
-    man = pd.read_csv(manifest_csv)
-    src_col = detect(man, SOURCE_RENDER_CANDIDATES)
-    label_col = detect(man, ("label", "target", "y"))
-    fake_cols = [c for c in man.columns if c.lower().startswith("fake")]
-    fake_cols = sorted(fake_cols)[:max_fakes] if max_fakes >= 0 else sorted(fake_cols)
-    key_col = detect(man, ("key", "case_id"), required=False)
-
-    raw_by_stem = {}
-    if raw_csv is not None:
-        raw = pd.read_csv(raw_csv)
-        raw_img = detect(raw, IMAGE_COL_CANDIDATES)
-        raw_lab = detect(raw, ("label", "target", "y"))
-        for _, row in raw.iterrows():
-            raw_by_stem[stem_of(row[raw_img])] = (str(row[raw_img]), int(row[raw_lab]))
-
-    records, joined, mismatched = [], 0, 0
-    for _, row in man.iterrows():
-        label = int(row[label_col])
-        views = {"src_render": str(row[src_col])}
-        for c in fake_cols:
-            if isinstance(row[c], str) and row[c]:
-                views[c] = str(row[c])
-        if raw_by_stem:
-            stem = key_stem(row[key_col]) if key_col else stem_of(row[src_col])
-            hit = raw_by_stem.get(stem)
-            if hit is not None:
-                if hit[1] != label:
-                    mismatched += 1
-                else:
-                    views[RAW_VIEW] = hit[0]
-                    joined += 1
-        records.append({"label": label, "views": views})
-
-    if raw_by_stem:
-        if mismatched:
+def build_records(
+    manifest: Path,
+    split: str,
+    views: list[str],
+) -> list[dict[str, object]]:
+    frame = pd.read_csv(manifest)
+    required = {"split", "case_id", "label", *views}
+    missing_columns = sorted(required - set(frame.columns))
+    if missing_columns:
+        raise ValueError(
+            f"{manifest} is missing {missing_columns}; expected da_manifest.csv schema"
+        )
+    frame = frame[frame["split"] == split].reset_index(drop=True)
+    if frame.empty:
+        raise ValueError(f"split {split!r} is empty in {manifest}")
+    records = []
+    seen_cases: dict[str, int] = {}
+    for row_number, row in frame.iterrows():
+        if pd.isna(row["case_id"]):
+            raise ValueError(f"empty case_id in {manifest}:{row_number + 2}")
+        case_id = str(row["case_id"]).strip()
+        if not case_id:
+            raise ValueError(f"empty case_id in {manifest}:{row_number + 2}")
+        label = int(row["label"])
+        if label not in (0, 1):
             raise ValueError(
-                f"{mismatched} cases had conflicting labels between {raw_csv} and "
-                f"{manifest_csv}; refusing to train on an ambiguous join"
+                f"expected binary source label in {manifest}:{row_number + 2}, got {label}"
             )
-        if joined == 0:
-            print(f"[warn] no raw view could be joined from {raw_csv}; continuing without it")
-        else:
-            print(f"[join] raw view attached to {joined}/{len(records)} cases")
-    return records, [RAW_VIEW, "src_render"] + fake_cols
+        if case_id in seen_cases:
+            raise ValueError(
+                f"duplicate case_id {case_id!r} in split {split!r}; "
+                "the teacher expects one manifest row per case"
+            )
+        seen_cases[case_id] = label
+        available = {}
+        for view in views:
+            value = row[view]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"missing {view} path for case {case_id!r} "
+                    f"in {manifest}:{row_number + 2}"
+                )
+            path = Path(value).expanduser()
+            if not path.is_absolute():
+                path = (manifest.parent / path).resolve()
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"{view} image for case {case_id!r} does not exist: {path}"
+                )
+            available[view] = str(path.resolve())
+        records.append(
+            {
+                "case_id": case_id,
+                "label": label,
+                "views": available,
+            }
+        )
+    counts = {v: sum(v in r["views"] for r in records) for v in views}
+    print(f"[{split}] {len(records)} cases; views present: {counts}")
+    return records
+
+
+def assert_disjoint_cases(
+    train_records: list[dict[str, object]],
+    validation_records: list[dict[str, object]],
+) -> None:
+    train_cases = {str(record["case_id"]) for record in train_records}
+    validation_cases = {str(record["case_id"]) for record in validation_records}
+    overlap = sorted(train_cases & validation_cases)
+    if overlap:
+        raise ValueError(
+            f"source train/validation case overlap ({len(overlap)}): {overlap[:5]}"
+        )
 
 
 class MixedRenderDataset(Dataset):
     """One item per case; the rendering is RESAMPLED every epoch.
 
-    Sampling one view per case (rather than emitting every view) keeps the epoch size and
-    therefore the effective learning-rate schedule identical to the original source-only
+    Sampling one view per case, rather than emitting every view, keeps the epoch size -- and
+    therefore the effective learning-rate schedule -- identical to the original source-only
     training, so the two runs stay comparable.
     """
 
-    def __init__(self, records, resize: int, train: bool, seed: int = 0, view: str | None = None):
+    def __init__(
+        self, records, resize: int, train: bool, seed: int = 0, view: str | None = None
+    ):
         self.records = records
         self.tf = build_transform(resize)
         self.train = train
-        self.view = view                     # None -> sample; otherwise force one rendering
+        self.view = view  # None -> resample; otherwise force one rendering
         self.rng = random.Random(seed)
 
     def __len__(self):
@@ -172,18 +188,12 @@ class MixedRenderDataset(Dataset):
     def __getitem__(self, index):
         record = self.records[index]
         views = record["views"]
-        if self.view is not None:
-            name = self.view
-            if name not in views:
-                name = "src_render" if "src_render" in views else next(iter(views))
-        else:
-            name = self.rng.choice(sorted(views.keys()))
+        name = self.view if (self.view in views) else self.rng.choice(sorted(views))
         image = Image.open(views[name]).convert("L")
         if self.train:
             if self.rng.random() < 0.5:
                 image = image.transpose(Image.FLIP_LEFT_RIGHT)
-            angle = self.rng.uniform(-10, 10)
-            image = image.rotate(angle, resample=Image.BILINEAR)
+            image = image.rotate(self.rng.uniform(-10, 10), resample=Image.BILINEAR)
         return self.tf(image), int(record["label"])
 
 
@@ -194,105 +204,171 @@ def evaluate(model, records, resize, device, view, batch_size=32):
         return None
     loader = DataLoader(
         MixedRenderDataset(subset, resize, train=False, view=view),
-        batch_size=batch_size, shuffle=False, num_workers=0,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
     )
     model.eval()
     probs, labels = [], []
     for images, targets in loader:
-        logits = model(images.to(device))
-        probs.append(F.softmax(logits, dim=1)[:, 1].cpu().numpy())
+        probs.append(F.softmax(model(images.to(device)), dim=1)[:, 1].cpu().numpy())
         labels.append(targets.numpy())
-    prob = np.concatenate(probs)
-    label = np.concatenate(labels)
-    pred = (prob >= 0.5).astype(int)
+    prob, label = np.concatenate(probs), np.concatenate(labels)
     auc = roc_auc_score(label, prob) if len(np.unique(label)) == 2 else float("nan")
-    return {"auc": float(auc), "acc": float((pred == label).mean()), "n": int(len(label))}
+    return {
+        "auc": float(auc),
+        "acc": float(((prob >= 0.5).astype(int) == label).mean()),
+        "n": int(len(label)),
+    }
 
 
 def report(model, records, resize, device, views, title):
-    print(f"\n--- {title} (source validation, per rendering) ---")
+    print(f"\n--- {title} ---")
     rows = {}
     for view in views:
-        metrics = evaluate(model, records, resize, device, view)
-        if metrics is None:
+        m = evaluate(model, records, resize, device, view)
+        if m is None:
             continue
-        rows[view] = metrics
-        print("  %-12s AUC %.4f   acc %.4f   n=%d" % (view, metrics["auc"], metrics["acc"], metrics["n"]))
+        rows[view] = m
+        print("  %-10s AUC %.4f   acc %.4f   n=%d" % (view, m["auc"], m["acc"], m["n"]))
     if rows:
         worst = min(rows, key=lambda k: rows[k]["auc"])
-        print("  worst rendering: %s (AUC %.4f)" % (worst, rows[worst]["auc"]))
+        best = max(rows, key=lambda k: rows[k]["auc"])
+        print(
+            "  best %s %.4f | worst %s %.4f | spread %.4f"
+            % (
+                best,
+                rows[best]["auc"],
+                worst,
+                rows[worst]["auc"],
+                rows[best]["auc"] - rows[worst]["auc"],
+            )
+        )
     return rows
 
 
+def load_into(model, weights: Path, device, tag: str):
+    blob = torch.load(weights, map_location=device, weights_only=False)
+    state = (
+        blob["state_dict"] if isinstance(blob, dict) and "state_dict" in blob else blob
+    )
+    result = model.load_state_dict(
+        {k.replace("module.", ""): v for k, v in state.items()}, strict=False
+    )
+    missing = [k for k in result.missing_keys if "num_batches" not in k]
+    if missing or result.unexpected_keys:
+        raise RuntimeError(
+            f"{tag} checkpoint/model mismatch: missing={missing[:4]}, "
+            f"unexpected={list(result.unexpected_keys)[:4]}"
+        )
+    print(f"[{tag}] loaded {weights}")
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--train_manifest", type=Path, required=True,
-                        help="source TRAIN manifest with before_png + fake_* columns")
-    parser.add_argument("--val_manifest", type=Path, required=True,
-                        help="source VALIDATION manifest, same schema")
-    parser.add_argument("--raw_train_csv", type=Path, default=None, help="optional raw-PNG source train CSV")
-    parser.add_argument("--raw_val_csv", type=Path, default=None, help="optional raw-PNG source val CSV")
-    parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--baseline_weights", type=Path, default=None,
-                        help="old teacher checkpoint, scored on the same renderings for comparison")
-    parser.add_argument("--init_weights", type=Path, default=None,
-                        help="warm-start from an existing source classifier (recommended: the "
-                             "validated raw-only teacher). Keeps the new teacher anchored to the "
-                             "model whose source-validation numbers are already known.")
-    parser.add_argument("--backbone", default="custom_resnet50_space")
-    parser.add_argument("--pretrained", default="imagenet")
-    parser.add_argument("--num_classes", type=int, default=2)
-    parser.add_argument("--image_size", type=int, default=224)
-    parser.add_argument("--max_fakes", type=int, default=5, help="-1 for all fake_* columns")
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", default="cuda")
-    return parser.parse_args()
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "--manifest",
+        type=Path,
+        required=True,
+        help="da_manifest.csv with explicit source train/validation splits",
+    )
+    p.add_argument("--train_split", default="src_train")
+    p.add_argument("--val_split", default="src_valid")
+    p.add_argument(
+        "--views", default=DEFAULT_VIEWS, help="comma-separated manifest columns to mix"
+    )
+    p.add_argument("--out", type=Path, required=True)
+    p.add_argument(
+        "--init_weights",
+        type=Path,
+        default=None,
+        help="warm-start from the validated raw-only teacher (recommended)",
+    )
+    p.add_argument(
+        "--baseline_weights",
+        type=Path,
+        default=None,
+        help="old teacher, scored on the same renderings for a before/after table",
+    )
+    p.add_argument("--backbone", default="custom_resnet50_space")
+    p.add_argument("--pretrained", default="imagenet")
+    p.add_argument("--num_classes", type=int, default=2)
+    p.add_argument("--image_size", type=int, default=224)
+    p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--device", default="cuda")
+    return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.train_split == args.val_split:
+        raise ValueError("train_split and val_split must be different")
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
-    device = torch.device(args.device if (torch.cuda.is_available() and "cuda" in args.device) else "cpu")
+    device = torch.device(
+        args.device if (torch.cuda.is_available() and "cuda" in args.device) else "cpu"
+    )
+    views = [v.strip() for v in args.views.split(",") if v.strip()]
 
-    train_records, view_names = build_records(args.train_manifest, args.raw_train_csv, args.max_fakes)
-    val_records, _ = build_records(args.val_manifest, args.raw_val_csv, args.max_fakes)
-    present = [v for v in view_names if any(v in r["views"] for r in train_records)]
-    print("renderings in training mixture: %s" % present)
-    print("train cases %d | val cases %d" % (len(train_records), len(val_records)))
+    train_records = build_records(args.manifest, args.train_split, views)
+    val_records = build_records(args.manifest, args.val_split, views)
+    assert_disjoint_cases(train_records, val_records)
+    present = [v for v in views if any(v in r["views"] for r in train_records)]
+    print("renderings mixed during training: %s" % present)
 
-    model = build_model(args.backbone, num_classes=args.num_classes, pretrained=args.pretrained, device=device)
+    model = build_model(
+        args.backbone,
+        num_classes=args.num_classes,
+        pretrained=args.pretrained,
+        device=device,
+    )
     if args.init_weights is not None:
-        blob = torch.load(args.init_weights, map_location=device, weights_only=False)
-        state = blob["state_dict"] if isinstance(blob, dict) and "state_dict" in blob else blob
-        result = model.load_state_dict({k.replace("module.", ""): v for k, v in state.items()}, strict=False)
-        missing = [k for k in result.missing_keys if "num_batches" not in k]
-        if missing or result.unexpected_keys:
-            raise RuntimeError(
-                f"warm-start checkpoint does not match the model: missing={missing[:4]}, "
-                f"unexpected={list(result.unexpected_keys)[:4]}"
-            )
-        print(f"[init] warm-started from {args.init_weights}")
+        load_into(model, args.init_weights, device, "init")
 
     if args.baseline_weights is not None:
-        baseline = build_model(args.backbone, num_classes=args.num_classes, pretrained="none", device=device)
-        blob = torch.load(args.baseline_weights, map_location=device, weights_only=False)
-        state = blob["state_dict"] if isinstance(blob, dict) and "state_dict" in blob else blob
-        baseline.load_state_dict({k.replace("module.", ""): v for k, v in state.items()}, strict=False)
-        report(baseline, val_records, args.image_size, device, present, "BASELINE teacher (raw-only training)")
+        baseline = build_model(
+            args.backbone,
+            num_classes=args.num_classes,
+            pretrained="none",
+            device=device,
+        )
+        load_into(baseline, args.baseline_weights, device, "baseline")
+        report(
+            baseline,
+            val_records,
+            args.image_size,
+            device,
+            present,
+            "BASELINE teacher (raw-only training)",
+        )
         del baseline
-        torch.cuda.empty_cache() if device.type == "cuda" else None
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     loader = DataLoader(
-        MixedRenderDataset(train_records, args.image_size, train=True, seed=args.seed),
-        batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=False,
+        MixedRenderDataset(
+            train_records,
+            args.image_size,
+            train=True,
+            seed=args.seed,
+        ),
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=0,
     )
-    optimiser = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimiser = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
     criterion = nn.CrossEntropyLoss()
 
     best_worst, best_state, best_epoch, best_rows = -1.0, None, -1, None
@@ -307,25 +383,43 @@ def main() -> None:
             optimiser.step()
             total += float(loss) * images.shape[0]
             seen += images.shape[0]
-        rows = {}
-        for view in present:
-            metrics = evaluate(model, val_records, args.image_size, device, view)
-            if metrics is not None:
-                rows[view] = metrics
-        worst = min(m["auc"] for m in rows.values()) if rows else float("nan")
-        mean = float(np.mean([m["auc"] for m in rows.values()])) if rows else float("nan")
-        print("epoch %02d  loss %.4f  val AUC mean %.4f  worst %.4f" % (epoch, total / max(seen, 1), mean, worst),
-              flush=True)
+        rows = {
+            view: metrics
+            for view in present
+            if (
+                metrics := evaluate(
+                    model,
+                    val_records,
+                    args.image_size,
+                    device,
+                    view,
+                )
+            )
+        }
+        worst = min(m["auc"] for m in rows.values())
+        mean = float(np.mean([m["auc"] for m in rows.values()]))
+        print(
+            "epoch %02d  loss %.4f  val AUC mean %.4f  worst %.4f"
+            % (epoch, total / max(seen, 1), mean, worst),
+            flush=True,
+        )
         if worst > best_worst:
-            best_worst, best_epoch = worst, epoch
-            best_rows = rows
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_worst, best_epoch, best_rows = worst, epoch, rows
+            best_state = {
+                k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+            }
 
     if best_state is None:
         raise RuntimeError("no epoch produced a usable validation score")
     model.load_state_dict(best_state)
-    rows = report(model, val_records, args.image_size, device, present,
-                  f"RENDER-ROBUST teacher (best epoch {best_epoch}, selected on worst rendering)")
+    rows = report(
+        model,
+        val_records,
+        args.image_size,
+        device,
+        present,
+        f"RENDER-ROBUST teacher (best epoch {best_epoch}, selected on worst rendering)",
+    )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -335,15 +429,41 @@ def main() -> None:
             "best_metric_name": "worst_rendering_auc",
             "best_metric_value": best_worst,
             "val_metrics": rows,
-            "args": vars(args) | {k: str(v) for k, v in vars(args).items() if isinstance(v, Path)},
             "renderings": present,
-            "note": "source labels only; no target image or label is read by this script",
+            "args": {
+                key: str(value) if isinstance(value, Path) else value
+                for key, value in vars(args).items()
+            },
+            "data_protocol": {
+                "manifest": str(args.manifest.resolve()),
+                "train_split": args.train_split,
+                "validation_split": args.val_split,
+                "train_cases": len(train_records),
+                "validation_cases": len(val_records),
+                "case_overlap": 0,
+                "heldout_test_used_for_selection": False,
+                "target_labels_used": False,
+            },
         },
         args.out,
     )
     summary = args.out.with_suffix(args.out.suffix + ".json")
-    summary.write_text(json.dumps({"best_epoch": best_epoch, "worst_rendering_auc": best_worst,
-                                   "per_rendering": best_rows, "renderings": present}, indent=2), encoding="utf-8")
+    summary.write_text(
+        json.dumps(
+            {
+                "best_epoch": best_epoch,
+                "worst_rendering_auc": best_worst,
+                "per_rendering": best_rows,
+                "renderings": present,
+                "train_split": args.train_split,
+                "validation_split": args.val_split,
+                "heldout_test_used_for_selection": False,
+                "target_labels_used": False,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     print(f"\nSaved teacher: {args.out}\nSaved summary: {summary}")
 
 
