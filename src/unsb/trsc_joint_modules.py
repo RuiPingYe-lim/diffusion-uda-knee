@@ -60,8 +60,36 @@ class SourceWarmStartResNet50(nn.Module):
         self.avgpool = nn.AdaptiveAvgPool2d(1)
         self.classifier = nn.Linear(feature_dim, num_classes)
 
+    def forward_to_layer3(self, image: torch.Tensor) -> torch.Tensor:
+        """Run through ResNet layer3 without changing checkpoint key names."""
+
+        feature = image
+        for module in self.stem[:7]:
+            feature = module(feature)
+        return feature
+
+    def forward_from_layer3(
+        self,
+        layer3_features: torch.Tensor,
+        return_pooled: bool = False,
+    ):
+        """Run layer4 and the validated attention classifier head."""
+
+        if layer3_features.ndim != 4 or layer3_features.shape[1] != 1024:
+            raise ValueError(
+                "layer3_features must be [B,1024,H,W], got "
+                f"{tuple(layer3_features.shape)}"
+            )
+        feature_map = self.space_attn(self.stem[7](layer3_features))
+        pooled = self.avgpool(feature_map).flatten(1)
+        logits = self.classifier(pooled)
+        if return_pooled:
+            return logits, pooled
+        return logits
+
     def extract_features(self, image: torch.Tensor) -> torch.Tensor:
-        feature_map = self.space_attn(self.stem(image))
+        layer3_features = self.forward_to_layer3(image)
+        feature_map = self.space_attn(self.stem[7](layer3_features))
         return self.avgpool(feature_map).flatten(1)
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:

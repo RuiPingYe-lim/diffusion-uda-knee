@@ -73,6 +73,16 @@ class InstallDoscOverlayTests(unittest.TestCase):
                 ).is_file()
             )
             self.assertTrue(
+                (unsb_root / "models" / "safebridge_modules.py").is_file()
+            )
+            self.assertTrue(
+                (
+                    unsb_root
+                    / "models"
+                    / "safebridge_joint_sb_model.py"
+                ).is_file()
+            )
+            self.assertTrue(
                 (unsb_root / "data" / "trsc_unaligned_dataset.py").is_file()
             )
             model_overlay = (unsb_root / "models" / "dosc_sb_model.py").read_text()
@@ -97,6 +107,11 @@ class InstallDoscOverlayTests(unittest.TestCase):
             ).read_text()
             self.assertIn("class TrscDabrfJointSBModel", dabrf_model)
             self.assertIn("self.optimizer_R.step()", dabrf_model)
+            safebridge_model = (
+                unsb_root / "models" / "safebridge_joint_sb_model.py"
+            ).read_text()
+            self.assertIn("class SafebridgeJointSBModel", safebridge_model)
+            self.assertIn("project_diagnostic_nullspace", safebridge_model)
             canonical_dataset = (
                 unsb_root / "data" / "trsc_unaligned_dataset.py"
             ).read_text()

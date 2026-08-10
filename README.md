@@ -28,6 +28,10 @@ and diagnostic experiments that motivated the design.
    gate after each K-view U1 candidate, with detached calibrated-diagnosis, target-style-progress,
    and residual-radius constraints. This is an unvalidated attribution experiment, not a claimed
    improvement; U3/U5 remain stopped.
+7. **SafeBridge-UDA state rejection and constrained feature transfer**
+   (`src/unsb/SAFEBRIDGE.md`) — consider U1/U3/U5 per case, reject unsafe or unsupported states,
+   and transfer only real-target-supported feature residuals after a local diagnostic null-space
+   projection and nonlinear backtracking. Classification gradients are blocked from UNSB.
 
 ## Repository layout
 

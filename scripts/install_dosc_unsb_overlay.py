@@ -23,6 +23,12 @@ OVERLAY_FILES = {
     OVERLAY_ROOT / "trsc_dabrf_joint_sb_model.py": Path(
         "models/trsc_dabrf_joint_sb_model.py"
     ),
+    OVERLAY_ROOT / "safebridge_modules.py": Path(
+        "models/safebridge_modules.py"
+    ),
+    OVERLAY_ROOT / "safebridge_joint_sb_model.py": Path(
+        "models/safebridge_joint_sb_model.py"
+    ),
     OVERLAY_ROOT / "trsc_unaligned_dataset.py": Path("data/trsc_unaligned_dataset.py"),
 }
 
